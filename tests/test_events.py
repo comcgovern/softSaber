@@ -31,7 +31,7 @@ from softsaber.parse.events import classify
         ("Hall grounded into double play c to 2b to 1b.", "DP", 0),
         ("Owens reached on a fielding error by ss.", "ROE", 0),
         ("Hayes reached on a fielder's choice.", "FC", 0),
-        ("Park grounded out to p, SAC, 1 RBI; runner scored.", "GO", 1),
+        ("Park grounded out to p, SAC, 1 RBI; runner scored.", "SH", 1),
     ],
 )
 def test_classify_outcome(text: str, expected_outcome: str, expected_rbi: int) -> None:

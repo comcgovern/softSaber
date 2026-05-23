@@ -4,18 +4,13 @@ We map free-text descriptions like::
 
     "Smith, J. singled to right center, 2 RBI; Jones scored; Brown to third."
 
-into a row with::
+into a structured row with the batter's outcome plus a list of explicit
+runner movement clauses (``Jones scored``, ``Brown to third``) that the
+base-out simulator in :mod:`softsaber.parse.baserunners` consumes.
 
-    batter="Smith, J.", outcome="1B", rbi=2, fielders=["RF","CF"],
-    out_on_play=0, sac=False, ...
-
-This is the layer that gates everything downstream. Anything we can't parse
-is logged and excluded from the PA-level table so it doesn't silently
-corrupt linear weights.
-
-Status: STUB. Wire up the classifier here once we have real PBP samples
-cached locally; build a comprehensive test suite in tests/test_events.py
-covering each ``OUTCOME_PATTERNS`` entry below.
+Anything we can't classify (pitching changes, defensive substitutions, etc.)
+returns ``outcome=None`` and is dropped from the PA-level table so it can't
+silently corrupt linear weights.
 """
 
 from __future__ import annotations
@@ -80,31 +75,85 @@ _BATTER_RE = re.compile(
 
 _RBI_RE = re.compile(r"(\d+)\s*RBI", re.I)
 
+# Movement-clause patterns. Order matters — "out at X" before "to X".
+_MOVE_SCORED_RE = re.compile(r"\bscored\b", re.I)
+_MOVE_OUT_RE = re.compile(
+    r"\b(?:out at (?:second|third|home)|caught stealing|picked off|"
+    r"thrown out|doubled off)\b",
+    re.I,
+)
+_MOVE_TO_RE = re.compile(r"\bto (second|third|home)\b", re.I)
+
+# Sacrifice fly detection (modifies outcome from FO/LO/PO to SF).
+_SAC_FLY_RE = re.compile(r"\b(?:sf|sacrifice fly|sac fly)\b", re.I)
+_SAC_BUNT_RE = re.compile(r"\bsac\b|\bsacrifice bunt\b|\bsac bunt\b", re.I)
+
+
+# Per-base destination as small int: 1=1B, 2=2B, 3=3B, 4=home.
+_BASE_INT = {"second": 2, "third": 3, "home": 4}
+
+
+@dataclass
+class RunnerMove:
+    """One runner movement clause inside an event."""
+
+    # 'advance' (to base 2 or 3), 'score' (cross home), 'out' (caught on bases)
+    kind: str
+    to_base: int  # 2, 3, 4 (score), or 0 (out)
+
 
 @dataclass
 class ParsedEvent:
     outcome: str | None
     batter: str | None
     rbi: int = 0
+    moves: list[RunnerMove] = field(default_factory=list)
     raw: str = ""
-    notes: list[str] = field(default_factory=list)
 
 
 def classify(text: str) -> ParsedEvent:
-    """Single-event classifier. Returns ``outcome=None`` for unmatched text."""
+    """Classify one event-text row.
+
+    Returns ``outcome=None`` for unmatched (substitution/comment) rows.
+    The first ``;``-delimited clause is treated as the batter's primary
+    outcome; subsequent clauses are parsed as runner movement.
+    """
     out = ParsedEvent(outcome=None, batter=None, raw=text)
 
     m_b = _BATTER_RE.match(text)
     if m_b:
         out.batter = m_b.group("name").strip()
 
+    primary, *rest = [c.strip() for c in text.split(";")]
+
     for pat, code in OUTCOME_PATTERNS:
-        if pat.search(text):
+        if pat.search(primary):
             out.outcome = code
             break
+
+    # SF/SH override: a fly out / bunt that drives in a run is sacrifice.
+    if out.outcome in {"FO", "LO", "PO"} and _SAC_FLY_RE.search(text):
+        out.outcome = "SF"
+    if out.outcome == "GO" and _SAC_BUNT_RE.search(text):
+        out.outcome = "SH"
 
     m_rbi = _RBI_RE.search(text)
     if m_rbi:
         out.rbi = int(m_rbi.group(1))
+
+    # Pull movement clauses from the non-primary fragments. Also scan the
+    # primary for "scored"/"to third" mentions that come AFTER a comma
+    # (some NCAA boxes put first-runner movement on the same clause).
+    for clause in [primary, *rest]:
+        # Skip the batter's own action in the primary — but a primary
+        # like "Smith homered, Jones scored" still needs the second half
+        # scanned. Easiest: scan every clause for movement keywords.
+        for m in _MOVE_OUT_RE.finditer(clause):
+            out.moves.append(RunnerMove(kind="out", to_base=0))
+        for m in _MOVE_SCORED_RE.finditer(clause):
+            out.moves.append(RunnerMove(kind="score", to_base=4))
+        for m in _MOVE_TO_RE.finditer(clause):
+            base = _BASE_INT[m.group(1).lower()]
+            out.moves.append(RunnerMove(kind="advance" if base < 4 else "score", to_base=base))
 
     return out

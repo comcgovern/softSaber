@@ -36,18 +36,31 @@ ALL_STATES = [
 
 
 def compute_re_matrix(pa: pd.DataFrame) -> pd.Series:
-    """Return RE per base-out state, indexed by ``state_before``."""
+    """Return RE per base-out state, indexed by ``state_before``.
+
+    Restricts to fully-resolved half-innings (``half_inning_ok``) so that
+    badly-parsed halves don't bias the matrix.
+    """
     if pa.empty or "state_before" not in pa.columns:
         return pd.Series(dtype=float)
 
+    pa = pa.copy()
+    if "half_inning_ok" in pa.columns:
+        pa = pa[pa["half_inning_ok"].astype(bool)]
+    if pa.empty:
+        return pd.Series(dtype=float)
+
     keys = ["game_id", "inning", "top_bottom"]
-    pa = pa.sort_values([*keys, "play_id"]).copy()
-    pa["future_runs"] = (
-        pa.groupby(keys)["runs_on_play"]
-        .transform(lambda s: s[::-1].cumsum()[::-1].shift(-1, fill_value=0) + s)
-    )
-    # ``future_runs`` = runs scored on this play + runs scored on all later
-    # plays in the half-inning. That is the value of being in state_before.
+    pa = pa.sort_values([*keys, "play_id"]).reset_index(drop=True)
+
+    # Reverse-cumulative-sum within each half-inning: ``future_runs[i]`` =
+    # runs scored from play i to the end of the half-inning, inclusive. That
+    # is exactly the value of being in ``state_before[i]``.
+    pa["future_runs"] = 0.0
+    for _, g in pa.groupby(keys, sort=False):
+        idx = g.index
+        rev_cum = g["runs_on_play"][::-1].cumsum()[::-1]
+        pa.loc[idx, "future_runs"] = rev_cum.astype(float).values
     return pa.groupby("state_before")["future_runs"].mean()
 
 

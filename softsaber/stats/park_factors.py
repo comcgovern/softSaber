@@ -77,11 +77,34 @@ def multi_year_park_factors(
 ) -> pd.DataFrame:
     """Weighted multi-year park factors with regression.
 
-    STUB: implement once :func:`compute_raw_park_factors` is verified on
-    real data. The structure should be:
-
-        raw_pfs = {y: compute_raw_park_factors(games_by_year[y]) for y in ...}
-        combined = weighted mean of raw_pf across years per home_team_id
-        return regress_park_factors(combined)
+    ``games_by_year`` maps season → games DataFrame. ``weights`` maps season
+    → relative weight (defaults to equal). Returns one row per
+    ``home_team_id`` with the regressed multi-year ``pf``.
     """
-    raise NotImplementedError("multi_year_park_factors not yet implemented")
+    years = sorted(games_by_year.keys())
+    if not years:
+        return pd.DataFrame()
+    w = weights or {y: 1.0 for y in years}
+
+    raw_frames = []
+    for y in years:
+        df = compute_raw_park_factors(games_by_year[y])
+        if df.empty:
+            continue
+        df = df.assign(weight=w.get(y, 1.0))
+        raw_frames.append(df)
+    if not raw_frames:
+        return pd.DataFrame()
+
+    raw = pd.concat(raw_frames, ignore_index=True)
+    # Weighted mean of raw_pf per team across years; weight each year by
+    # ``weight * home_g`` so a 30-game home season counts more than a
+    # 5-game scraping-failed season.
+    raw["wpf"] = raw["raw_pf"] * raw["weight"] * raw["home_g"]
+    raw["wgames"] = raw["weight"] * raw["home_g"]
+    combined = (
+        raw.groupby("home_team_id", as_index=False)
+        .agg(home_g=("home_g", "sum"), wpf=("wpf", "sum"), wgames=("wgames", "sum"))
+    )
+    combined["raw_pf"] = combined["wpf"] / combined["wgames"]
+    return regress_park_factors(combined[["home_team_id", "home_g", "raw_pf"]], regression_games)

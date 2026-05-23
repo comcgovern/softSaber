@@ -21,7 +21,9 @@ from .ingest import teams as teams_mod
 
 app = typer.Typer(help="Softball analytics ingest + stats CLI.")
 ingest_app = typer.Typer(help="Pull data from stats.ncaa.org.")
+stats_app = typer.Typer(help="Compute advanced stats from processed PBP.")
 app.add_typer(ingest_app, name="ingest")
+app.add_typer(stats_app, name="stats")
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -94,6 +96,49 @@ def ingest_all(
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
         teams_mod.build_teams_table(softball_ids, year)
         pbp_mod.ingest_season_pbp(games, year)
+
+
+@stats_app.command("wrc")
+def stats_wrc(
+    seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
+    verbose: bool = False,
+) -> None:
+    """End-to-end stats run: PBP → PA → RE24 → wOBA wts → wRC+ leaderboard.
+
+    Reads cached ``pbp_raw`` and ``games`` parquet partitions and writes
+    ``data/processed/wrc_plus/<seasons>.parquet``.
+    """
+    _setup_logging(verbose)
+    from . import storage
+    from .parse.pa import build_pa_table
+    from .stats.linear_weights import compute_linear_weights
+    from .stats.park_factors import multi_year_park_factors
+    from .stats.run_expectancy import compute_re24, compute_re_matrix
+    from .stats.wrc_plus import player_wrc_plus
+
+    pbp = storage.read_table("pbp_raw", partitions=[str(s) for s in seasons])
+    if pbp.empty:
+        raise SystemExit("no pbp_raw partitions found — run `ingest pbp` first")
+
+    pa = build_pa_table(pbp)
+    re = compute_re_matrix(pa)
+    pa_re24 = compute_re24(pa, re)
+    weights = compute_linear_weights(pa_re24)
+
+    games_by_year = {
+        y: storage.read_table("games", partitions=[str(y)]) for y in seasons
+    }
+    games_by_year = {y: g for y, g in games_by_year.items() if not g.empty}
+    pf = multi_year_park_factors(games_by_year) if games_by_year else None
+
+    wrc = player_wrc_plus(pa, weights, pf)
+    storage.write_partition("wrc_plus", "_".join(str(s) for s in seasons), wrc)
+    storage.write_partition("linear_weights", "_".join(str(s) for s in seasons), weights)
+    if pf is not None and not pf.empty:
+        storage.write_partition("park_factors", "_".join(str(s) for s in seasons), pf)
+
+    leader = wrc.sort_values("wRC+", ascending=False).head(15)
+    typer.echo(leader[["season", "batter", "batting_team", "PA", "wOBA", "wRC+"]].to_string(index=False))
 
 
 if __name__ == "__main__":

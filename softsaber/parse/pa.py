@@ -5,10 +5,7 @@ Output schema (one row per plate appearance):
     season, game_id, inning, top_bottom, batting_team, fielding_team,
     batter, outcome, rbi,
     state_before, state_after, runs_on_play,
-    play_id
-
-Rows where ``outcome`` is None are dropped (and logged) so the linear-weights
-math never sees an unclassified event.
+    half_inning_ok, play_id
 """
 
 from __future__ import annotations
@@ -21,34 +18,37 @@ from .baserunners import attach_base_out_state
 
 log = logging.getLogger(__name__)
 
+CANONICAL_COLUMNS = [
+    "season",
+    "game_id",
+    "inning",
+    "top_bottom",
+    "batting_team",
+    "fielding_team",
+    "batter",
+    "outcome",
+    "rbi",
+    "state_before",
+    "state_after",
+    "runs_on_play",
+    "half_inning_ok",
+    "play_id",
+]
+
 
 def build_pa_table(pbp_raw: pd.DataFrame) -> pd.DataFrame:
     if pbp_raw.empty:
         return pbp_raw
 
     enriched = attach_base_out_state(pbp_raw)
-
-    cols = [
-        "season",
-        "game_id",
-        "inning",
-        "top_bottom",
-        "batting_team",
-        "fielding_team",
-        "batter",
-        "outcome",
-        "rbi",
-        "state_before",
-        "state_after",
-        "runs_on_play",
-        "play_id",
-    ]
-    # ``rbi`` isn't parsed onto the row yet — events.classify carries it.
-    # When the parse layer is finished, plumb it through baserunners.py.
-    enriched["rbi"] = enriched.get("rbi", 0)
-
-    pa = enriched.loc[enriched["outcome"].notna(), [c for c in cols if c in enriched.columns]]
+    pa = enriched.loc[enriched["outcome"].notna(), :].copy()
     dropped = len(enriched) - len(pa)
     if dropped:
         log.info("PA build: dropped %d unclassified rows", dropped)
+
+    # Ensure every canonical column exists (some come from PBP, some from
+    # reconstruction). Keep extras for debugging.
+    for col in CANONICAL_COLUMNS:
+        if col not in pa.columns:
+            pa[col] = None
     return pa.reset_index(drop=True)
