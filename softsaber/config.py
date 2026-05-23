@@ -20,15 +20,12 @@ TARGET_DIVISION: str = "D1"
 
 # stats.ncaa.org national ranking page parameters for WSB Division I.
 #
-# stat_seq=271 is batting average for WSB — confirmed from:
+# stat_seq=281 is TEAM batting average for WSB — confirmed from:
 #   https://stats.ncaa.org/rankings/national_ranking?academic_year=2026.0
-#     &division=1.0&ranking_period=113.0&sport_code=WSB&stat_seq=271.0
-# stat_seq appears stable across years for the same sport/stat category.
-#
-# ranking_period is year-specific (the end-of-season period ID for that year).
-# 2026 confirmed = 113. Fill in 2024/2025 by visiting the ranking page for
-# those years and noting the ranking_period value in the URL.
-WSB_D1_RANKING_STAT_SEQ: int = 271
+#     &division=1.0&ranking_period=113.0&sport_code=WSB&stat_seq=281.0
+# Team rankings pages carry /teams/{id} links; individual rankings (stat_seq=271)
+# carry only /player/{id} links and are useless for team ID discovery.
+WSB_D1_RANKING_STAT_SEQ: int = 281
 
 WSB_D1_RANKING_PERIOD: dict[int, int | None] = {
     2024: 88,    # confirmed

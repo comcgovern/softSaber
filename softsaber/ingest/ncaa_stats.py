@@ -46,8 +46,9 @@ log = logging.getLogger(__name__)
 
 ROSTER_URL = "https://stats.ncaa.org/teams/{team_season_id}/roster"
 
-# Game individual-stats page: links to both team pages using year-specific IDs.
-CONTEST_STATS_URL = "https://stats.ncaa.org/contests/{contest_id}/individual_stats"
+# Game boxscore page on stats.ncaa.org: carries /teams/{id} links for both teams.
+# "individual_stats" does NOT have team links — it only has /player/{id} hrefs.
+CONTEST_STATS_URL = "https://stats.ncaa.org/contests/{contest_id}/box_score"
 
 # National ranking page: one per sport-division-year, lists all teams.
 # ranking_period is a year-specific ID (e.g. 113 for WSB 2026 end-of-season).
