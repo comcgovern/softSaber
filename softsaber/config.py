@@ -31,8 +31,8 @@ TARGET_DIVISION: str = "D1"
 WSB_D1_RANKING_STAT_SEQ: int = 271
 
 WSB_D1_RANKING_PERIOD: dict[int, int | None] = {
-    2024: None,  # TODO: inspect ranking URL for 2024 and note ranking_period
-    2025: None,  # TODO: inspect ranking URL for 2025
+    2024: 88,    # confirmed
+    2025: 101,   # confirmed
     2026: 113,   # confirmed
 }
 
