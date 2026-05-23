@@ -1,23 +1,38 @@
 """Play-by-play ingest from the ncaa-api.henrygd.me REST wrapper.
 
 One call per gameId returns a payload with ``periods[]`` where each period
-is an inning containing a list of play objects (``playbyplayStats`` from
-the GraphQL backend, or ``plays`` from henrygd's scrape — both shapes are
-handled). We flatten that into the row shape the parse layer consumes:
+is an inning.  The play list inside each period comes in one of three shapes:
 
-    game_id, inning, top_bottom, batting_team, fielding_team,
+Shape A — flat list of GenericPlay dicts with a per-play batting-team flag::
+
+    period["plays"] = [{playText, homeScore, visitorScore, isHomeBatting?}, ...]
+
+Shape B — dict split by half-inning::
+
+    period["plays"] = {"top": [...], "bottom": [...]}  # or "away"/"home"
+
+Shape C — list of at-bat groups, each grouping one half-inning's plays under
+a ``teamId`` key (the actual format returned by henrygd as of 2024–2025)::
+
+    period["playbyplayStats"] = [
+        {"teamId": 41890, "plays": [{playText, homeScore, visitorScore}, ...]},
+        {"teamId": 41974, "plays": [...]},
+        ...
+    ]
+
+All three shapes are handled.  Shape C uses the top-level ``teams`` array
+(``isHome`` flag) to map ``teamId`` → top/bottom inning half.
+
+Output row schema::
+
+    game_id, inning, top_bottom, batting_team_id, batting_team, fielding_team,
     away_team_runs, home_team_runs, events, play_id, row_idx
-
-**Field-name caveat:** NCAA does not publish a schema for this data and
-the per-play field names drift between the upstream sources. The
-candidate names below are reasonable guesses; the flattener logs the keys
-it actually sees the first time it can't find what it expects so we can
-tune from real data without another scrape.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, Iterable
 
 import pandas as pd
@@ -27,20 +42,26 @@ from . import ncaa_api
 
 log = logging.getLogger(__name__)
 
-# Candidate keys for the per-play text field, in priority order. Add to this
-# list as you discover variants in real responses; the first present non-empty
-# string wins.
+# Candidate keys for the per-play text field, in priority order.
 _TEXT_KEYS = ("text", "playText", "description", "summary", "narrative")
 
 # Candidate keys for which side is batting (boolean: True = home batting).
 _HOME_BATTING_KEYS = ("isHomeBatting", "homeBatting", "battingHome", "isHomeTeamBatting")
 
 # Candidate keys for the running score columns.
-_AWAY_SCORE_KEYS = ("awayScore", "scoreAway", "visitingScore")
+# "visitorScore" is the key used in henrygd's Shape C inner plays.
+_AWAY_SCORE_KEYS = ("awayScore", "scoreAway", "visitingScore", "visitorScore")
 _HOME_SCORE_KEYS = ("homeScore", "scoreHome")
 
 # Candidate keys for period (inning) number on the period object.
 _PERIOD_NUM_KEYS = ("periodNumber", "period", "inning", "number", "ordinal")
+
+# Boilerplate lines emitted by the NCAA feed that are not plate appearances.
+_BOILERPLATE_RE = re.compile(
+    r"^\s*(?:Batting (?:starts|ends)|Pitching change|Defensive sub|"
+    r"Inning (?:starts|ends)|End of inning)",
+    re.I,
+)
 
 _warned_keys: set[str] = set()
 
@@ -89,6 +110,62 @@ def _find_periods(payload: dict[str, Any]) -> list[Any]:
     return []
 
 
+def _home_team_id(payload: dict[str, Any]) -> str | None:
+    """Return the numeric teamId string of the home team from the payload's teams array."""
+    for t in payload.get("teams") or []:
+        if isinstance(t, dict) and t.get("isHome"):
+            tid = t.get("teamId")
+            return str(tid) if tid is not None else None
+    return None
+
+
+def _buckets_for_period(
+    period: dict[str, Any],
+    home_tid: str | None,
+) -> list[tuple[str, str | None, list[Any]]]:
+    """Return (side, batting_team_id, plays) triples for one inning period.
+
+    ``side`` is 'top', 'bottom', or 'auto'.  ``batting_team_id`` is the
+    numeric teamId string from the group when available (Shape C), else None.
+    """
+    plays_raw = period.get("plays") or period.get("playbyplayStats")
+
+    if isinstance(plays_raw, dict):
+        # Shape B: {"top": [...], "bottom": [...]} or {"away": [...], "home": [...]}
+        return [
+            ("top", None, plays_raw.get("top") or plays_raw.get("away") or []),
+            ("bottom", None, plays_raw.get("bottom") or plays_raw.get("home") or []),
+        ]
+
+    if not isinstance(plays_raw, list):
+        if plays_raw is not None:
+            _warn_once("playbyplayStats_shape", [type(plays_raw).__name__])
+        return []
+
+    # Distinguish Shape A (flat play list) from Shape C (list of at-bat groups).
+    # Shape C groups have a "plays" key and a "teamId" key; Shape A plays have text keys.
+    first_non_empty = next((x for x in plays_raw if isinstance(x, dict)), None)
+    if first_non_empty is not None and "plays" in first_non_empty and "teamId" in first_non_empty:
+        # Shape C: [{teamId, plays: [...]}, ...]
+        buckets: list[tuple[str, str | None, list[Any]]] = []
+        for group in plays_raw:
+            if not isinstance(group, dict):
+                continue
+            inner = group.get("plays")
+            if not isinstance(inner, list):
+                continue
+            tid = str(group.get("teamId", "")) or None
+            if tid and home_tid:
+                side = "bottom" if tid == home_tid else "top"
+            else:
+                side = "auto"
+            buckets.append((side, tid, inner))
+        return buckets
+
+    # Shape A: flat list of plays.
+    return [("auto", None, plays_raw)]
+
+
 def flatten_pbp(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
     """Turn one PBP payload into a flat DataFrame.
 
@@ -100,6 +177,8 @@ def flatten_pbp(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
     if not periods:
         log.debug("game %s: no periods in payload", game_id)
         return pd.DataFrame()
+
+    home_tid = _home_team_id(payload)
 
     rows: list[dict[str, Any]] = []
     for period in periods:
@@ -113,40 +192,22 @@ def flatten_pbp(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
         except (TypeError, ValueError):
             inning_int = 0
 
-        # Two shapes seen in NCAA generic-PBP: (a) flat list of plays with a
-        # per-play "home batting" flag, (b) split into half-inning sub-arrays.
-        # henrygd's REST wrapper labels the array ``plays``; the GraphQL
-        # backend used ``playbyplayStats``.
-        plays = period.get("plays") or period.get("playbyplayStats")
-        if isinstance(plays, dict):
-            # Shape (b): {"top": [...], "bottom": [...]} or {"away": [...], "home": [...]}.
-            buckets = [
-                ("top", plays.get("top") or plays.get("away") or []),
-                ("bottom", plays.get("bottom") or plays.get("home") or []),
-            ]
-        elif isinstance(plays, list):
-            buckets = [("auto", plays)]
-        else:
-            if plays is not None:
-                _warn_once("playbyplayStats_shape", [type(plays).__name__])
-            continue
+        buckets = _buckets_for_period(period, home_tid)
 
-        for bucket_side, bucket_plays in buckets:
+        for bucket_side, batting_tid, bucket_plays in buckets:
             row_idx = 0
             for play in bucket_plays:
                 if not isinstance(play, dict):
                     continue
                 text = _first(play, _TEXT_KEYS)
                 if not isinstance(text, str) or not text.strip():
-                    # Skip non-play rows (inning headers, etc.) silently.
+                    continue
+                if _BOILERPLATE_RE.match(text):
                     continue
 
                 if bucket_side == "auto":
                     home_bat = _first(play, _HOME_BATTING_KEYS)
                     if home_bat is None:
-                        # Fall back to a heuristic: NCAA tends to alternate,
-                        # but without a flag we just tag everything 'top' and
-                        # let downstream catch the imbalance. Log once.
                         _warn_once("home_batting_flag", list(play.keys()))
                         side = "top"
                     else:
@@ -159,9 +220,10 @@ def flatten_pbp(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
                         "game_id": game_id,
                         "inning": inning_int,
                         "top_bottom": side,
-                        # batting/fielding team names are filled in by the
-                        # caller from the games table; we don't have team
-                        # names on every play here.
+                        # batting_team_id carries the numeric teamId when known
+                        # (Shape C); used downstream for name resolution before
+                        # the games-table join populates batting_team.
+                        "batting_team_id": batting_tid or "",
                         "batting_team": play.get("battingTeam") or "",
                         "fielding_team": play.get("fieldingTeam") or "",
                         "away_team_runs": _first(play, _AWAY_SCORE_KEYS),
@@ -190,15 +252,23 @@ def fetch_game_pbp(game_id: str) -> pd.DataFrame:
 
 
 def _attach_team_names(pbp: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
-    """Backfill batting_team / fielding_team from the games table when PBP
-    rows didn't carry them (the common case).
+    """Backfill batting_team / fielding_team from the games table.
+
+    Uses ``top_bottom`` (away bats top, home bats bottom) to assign names.
+    Rows that already have a non-empty ``batting_team`` are left unchanged.
     """
     if pbp.empty:
         return pbp
-    names = games.set_index("game_id")[["away_team", "home_team"]].to_dict("index")
+    cols = ["away_team", "home_team", "away_team_id", "home_team_id"]
+    available = [c for c in cols if c in games.columns]
+    names = games.set_index("game_id")[available].to_dict("index")
     bt: list[str] = []
     ft: list[str] = []
     for r in pbp.itertuples(index=False):
+        if getattr(r, "batting_team", ""):
+            bt.append(r.batting_team)
+            ft.append(getattr(r, "fielding_team", ""))
+            continue
         rec = names.get(str(r.game_id), {})
         away, home = rec.get("away_team", ""), rec.get("home_team", "")
         if r.top_bottom == "top":

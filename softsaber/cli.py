@@ -157,8 +157,8 @@ def ingest_boxscore(
     _setup_logging(verbose)
     d = _parse_date(day) if day else None
     year = _resolve_season(season, d, "ingest boxscore")
-    games, _ = _games_for(year, d)
-    n = boxscore_mod.ingest_boxscores_for_games(games)
+    games, partition = _games_for(year, d)
+    n = boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
     typer.echo(f"boxscores cached: {n}")
 
 
@@ -195,7 +195,7 @@ def ingest_all(
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
         teams_mod.build_teams_table(softball_ids, d.year)
         pbp_mod.ingest_pbp_for_games(games, d.year, partition)
-        boxscore_mod.ingest_boxscores_for_games(games)
+        boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
         return
 
     years = seasons if seasons else list(TARGET_SEASONS)
@@ -206,7 +206,7 @@ def ingest_all(
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
         teams_mod.build_teams_table(softball_ids, year)
         pbp_mod.ingest_season_pbp(games, year)
-        boxscore_mod.ingest_boxscores_for_games(games)
+        boxscore_mod.ingest_boxscores_for_games(games, partition=str(year))
 
 
 @stats_app.command("wrc")
