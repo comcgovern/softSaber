@@ -22,11 +22,12 @@ Output parquet schema (``rosters/{season}``):
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
 from .. import storage
-from ..config import WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
+from ..config import REQUEST_WORKERS, WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
 from . import ncaa_stats
 
 log = logging.getLogger(__name__)
@@ -103,18 +104,22 @@ def ingest_season_rosters(
         log.warning("no teams with stats_ncaa_team_id for year %s", year)
         return pd.DataFrame()
 
-    frames: list[pd.DataFrame] = []
-    total = len(eligible)
-    for i, row in enumerate(eligible.itertuples(index=False), 1):
+    team_records = list(eligible.itertuples(index=False))
+    log.info("rosters: fetching %d teams with %d workers", len(team_records), REQUEST_WORKERS)
+
+    def _fetch_roster(row) -> pd.DataFrame:  # type: ignore[type-arg]
         tid = str(row.stats_ncaa_team_id)
-        log.debug("roster %s (%d/%d)", row.team_name, i, total)
         df = ncaa_stats.fetch_team_roster(tid, year)
         if df.empty:
-            continue
+            return df
         df["team_name"] = row.team_name
         df["stats_ncaa_team_id"] = tid
         df["season"] = year
-        frames.append(df)
+        return df
+
+    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        results = list(exe.map(_fetch_roster, team_records))
+    frames = [df for df in results if not df.empty]
 
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 

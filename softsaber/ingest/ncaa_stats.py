@@ -33,11 +33,13 @@ from __future__ import annotations
 import io
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pandas as pd
 from lxml import html as lxml_html
 
+from ..config import REQUEST_WORKERS
 from ..http_cache import FetchError, fetch
 
 log = logging.getLogger(__name__)
@@ -166,9 +168,10 @@ def discover_team_season_ids(
 
     # Path 1: per-game pages (no extra config needed).
     if contest_ids:
-        for cid in contest_ids[:max_contests]:
-            found = _discover_via_contest(str(cid))
-            results.update(found)
+        batch = [str(c) for c in contest_ids[:max_contests]]
+        with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+            for found in exe.map(_discover_via_contest, batch):
+                results.update(found)
 
     # Path 2: national rankings page (covers 100 % of teams in one fetch).
     if stat_seq is not None and ranking_period is not None:

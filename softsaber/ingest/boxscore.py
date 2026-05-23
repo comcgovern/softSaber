@@ -23,11 +23,13 @@ that join use ``team_seoname`` ↔ ``softball_id`` in the teams table.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import pandas as pd
 
 from .. import storage
+from ..config import REQUEST_WORKERS
 from . import ncaa_api
 
 log = logging.getLogger(__name__)
@@ -130,17 +132,18 @@ def ingest_boxscores_for_games(games: pd.DataFrame, partition: str | None = None
     ``"2024-05-04"``).  Returns the count of games successfully fetched.
     """
     game_ids = games["game_id"].astype(str).tolist()
-    total = len(game_ids)
-    fetched = 0
-    frames: list[pd.DataFrame] = []
-    for i, gid in enumerate(game_ids, 1):
-        log.debug("boxscore game %s (%d/%d)", gid, i, total)
+    log.info("boxscore: fetching %d games with %d workers", len(game_ids), REQUEST_WORKERS)
+
+    def _fetch_and_parse(gid: str) -> pd.DataFrame:
         payload = fetch_game_boxscore(gid)
-        if payload is not None:
-            fetched += 1
-            df = parse_boxscore(payload, gid)
-            if not df.empty:
-                frames.append(df)
+        if payload is None:
+            return pd.DataFrame()
+        return parse_boxscore(payload, gid)
+
+    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        results = list(exe.map(_fetch_and_parse, game_ids))
+    frames = [df for df in results if not df.empty]
+    fetched = sum(1 for df in results if not df.empty)
 
     if frames and partition is not None:
         combined = pd.concat(frames, ignore_index=True)

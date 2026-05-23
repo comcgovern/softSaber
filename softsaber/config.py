@@ -41,7 +41,10 @@ USER_AGENT = (
 REQUEST_TIMEOUT_S = 30
 REQUEST_RETRY_MAX = 5
 REQUEST_RETRY_BASE_DELAY_S = 2.0
-INTER_REQUEST_DELAY_S = 0.75
+
+# Rate limit and concurrency. The henrygd API supports 5 req/s.
+REQUEST_RATE_PER_SEC: float = 5.0
+REQUEST_WORKERS: int = 5
 
 
 @dataclass(frozen=True)

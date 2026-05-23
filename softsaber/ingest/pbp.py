@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Iterable
 
 import pandas as pd
 
 from .. import storage
+from ..config import REQUEST_WORKERS
 from . import ncaa_api
 
 log = logging.getLogger(__name__)
@@ -291,14 +293,11 @@ def ingest_pbp_for_games(
     ``partition`` controls the on-disk file name under ``pbp_raw/`` (e.g.
     ``"2024"`` for a full season, ``"2024-05-04"`` for a single day).
     """
-    frames: list[pd.DataFrame] = []
     game_ids = games["game_id"].astype(str).tolist()
-    total = len(game_ids)
-    for i, gid in enumerate(game_ids, 1):
-        log.debug("pbp game %s (%d/%d)", gid, i, total)
-        df = fetch_game_pbp(gid)
-        if not df.empty:
-            frames.append(df)
+    log.info("pbp: fetching %d games with %d workers", len(game_ids), REQUEST_WORKERS)
+    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        results = list(exe.map(fetch_game_pbp, game_ids))
+    frames = [df for df in results if not df.empty]
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not df.empty:
         df = _attach_team_names(df, games)
