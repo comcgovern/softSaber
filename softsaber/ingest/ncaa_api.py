@@ -2,12 +2,12 @@
 
 Two backends are in play:
 
-* **data.ncaa.com casablanca** — public REST scoreboard the ncaa.com site
-  consumes. Date-keyed path:
-  ``/casablanca/scoreboard/<sport>/<division>/<YYYY>/<MM>/<DD>/scoreboard.json``.
-  Used for scoreboard ingest because sdataprod's GraphQL scoreboard returns
-  empty payloads for prior-season dates. This is the same upstream that
-  ``ncaa-api.henrygd.me`` proxies.
+* **ncaa-api.henrygd.me** — third-party REST wrapper around the ncaa.com
+  site (MIT-licensed, ``github.com/henrygd/ncaa-api``). Date-keyed path:
+  ``/scoreboard/<sport>/<division>/<YYYY>/<MM>/<DD>``. Used for scoreboard
+  ingest because sdataprod's GraphQL scoreboard returns empty payloads for
+  prior-season dates and ``data.ncaa.com``'s casablanca bucket doesn't have
+  per-date keys for softball.
 * **sdataprod.ncaa.com GraphQL** — Apollo backend speaking persisted queries
   (sha256 hash + ``variables`` blob). Used for boxscore and play-by-play,
   which the REST endpoints don't expose. Hashes were lifted from
@@ -27,10 +27,10 @@ from ..http_cache import FetchError, fetch
 log = logging.getLogger(__name__)
 
 GRAPHQL_HOST = "https://sdataprod.ncaa.com/"
-CASABLANCA_HOST = "https://data.ncaa.com"
+SCOREBOARD_HOST = "https://ncaa-api.henrygd.me"
 
-# Sport-path slug used by the casablanca REST scoreboard (distinct from the
-# GraphQL ``sportCode``: REST uses "softball", GraphQL uses "WSB").
+# Sport-path slug used by the REST scoreboard (distinct from the GraphQL
+# ``sportCode``: REST uses "softball", GraphQL uses "WSB").
 SPORT_PATH_SOFTBALL = "softball"
 
 # Persisted-query hashes for the GraphQL endpoints. Update if NCAA rotates them.
@@ -68,7 +68,7 @@ def fetch_scoreboard(
     *,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Return the casablanca scoreboard payload for one date.
+    """Return the REST scoreboard payload for one date.
 
     ``sport_path`` is the URL slug (``softball``); ``division`` is ``d1``/``d2``/``d3``;
     ``contest_date`` is ``YYYY/MM/DD``. Caller reads ``payload["games"]``.
@@ -77,8 +77,8 @@ def fetch_scoreboard(
     empty ``{"games": []}`` payload so callers can iterate calendars cleanly.
     """
     url = (
-        f"{CASABLANCA_HOST}/casablanca/scoreboard/"
-        f"{sport_path}/{division.lower()}/{contest_date}/scoreboard.json"
+        f"{SCOREBOARD_HOST}/scoreboard/"
+        f"{sport_path}/{division.lower()}/{contest_date}"
     )
     ns = f"ncaa_api/scoreboard/{sport_path}_{division.lower()}"
     try:
@@ -111,10 +111,10 @@ def fetch_boxscore(contest_id: str, *, force: bool = False) -> dict[str, Any]:
 
 
 __all__ = [
-    "CASABLANCA_HOST",
     "HASH_BOXSCORE_SOFTBALL",
     "HASH_PBP_GENERIC",
     "NcaaApiError",
+    "SCOREBOARD_HOST",
     "SPORT_PATH_SOFTBALL",
     "fetch_boxscore",
     "fetch_play_by_play",

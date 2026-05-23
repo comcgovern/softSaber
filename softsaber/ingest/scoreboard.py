@@ -1,13 +1,14 @@
-"""Season scoreboard ingest, via NCAA's casablanca REST endpoint.
+"""Season scoreboard ingest, via the ncaa-api.henrygd.me REST wrapper.
 
-For each calendar day in a season we hit ``data.ncaa.com`` and pull the list
-of contests, then keep the ones that are final. The output is the join key
-for everything else: a ``games`` table keyed by ``game_id`` (NCAA's
-``gameID``) that points at the boxscore and play-by-play endpoints.
+For each calendar day in a season we pull the list of contests, then keep
+the ones that are final. The output is the join key for everything else:
+a ``games`` table keyed by ``game_id`` (NCAA's ``gameID``) that points at
+the boxscore and play-by-play endpoints.
 
-The sdataprod GraphQL scoreboard was the original source here, but it
-returns empty payloads for prior-season dates. The REST casablanca endpoint
-serves the same data ncaa.com itself consumes and works historically.
+The sdataprod GraphQL scoreboard was the original source here, but returns
+empty payloads for prior-season dates; ``data.ncaa.com``'s casablanca
+bucket doesn't have per-date keys for softball either. henrygd's wrapper
+scrapes the live ncaa.com scoreboard page and is what works today.
 """
 
 from __future__ import annotations
