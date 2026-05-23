@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "softsaber"
+version = "0.0.1"
+description = "Advanced softball analytics (park factors, linear weights, wRC+) from NCAA play-by-play."
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "lxml>=5.0",
+    "beautifulsoup4>=4.12",
+    "pandas>=2.1",
+    "pyarrow>=15.0",
+    "typer>=0.12",
+    "tenacity>=8.2",
+    "platformdirs>=4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+]
+
+[project.scripts]
+softsaber = "softsaber.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["softsaber*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
