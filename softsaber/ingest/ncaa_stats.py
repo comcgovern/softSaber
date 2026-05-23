@@ -50,11 +50,13 @@ ROSTER_URL = "https://stats.ncaa.org/teams/{team_season_id}/roster"
 CONTEST_STATS_URL = "https://stats.ncaa.org/contests/{contest_id}/individual_stats"
 
 # National ranking page: one per sport-division-year, lists all teams.
-# Requires a valid stat_seq for the sport; see WSB_D1_RANKING_STAT_SEQ in config.
+# ranking_period is a year-specific ID (e.g. 113 for WSB 2026 end-of-season).
+# stat_seq=271 is batting average for WSB (stable across years).
+# See WSB_D1_RANKING_STAT_SEQ and WSB_D1_RANKING_PERIOD in config.py.
 NATIONAL_RANKING_URL = (
     "https://stats.ncaa.org/rankings/national_ranking"
     "?academic_year={year}.0&division={division_id}.0"
-    "&ranking_period=0&sport_code=WSB&stat_seq={stat_seq}"
+    "&ranking_period={ranking_period}.0&sport_code=WSB&stat_seq={stat_seq}.0"
 )
 
 
@@ -110,9 +112,16 @@ def _discover_via_contest(contest_id: str) -> dict[str, str]:
         return {}
 
 
-def _discover_via_ranking(year: int, division_id: int, stat_seq: int) -> dict[str, str]:
+def _discover_via_ranking(
+    year: int, division_id: int, stat_seq: int, ranking_period: int
+) -> dict[str, str]:
     """Fetch the national ranking page and extract all team links in one shot."""
-    url = NATIONAL_RANKING_URL.format(year=year, division_id=division_id, stat_seq=stat_seq)
+    url = NATIONAL_RANKING_URL.format(
+        year=year,
+        division_id=division_id,
+        stat_seq=stat_seq,
+        ranking_period=ranking_period,
+    )
     try:
         html = fetch(url, namespace=f"ncaa_stats/rankings/{year}")
         found = _parse_team_links(html)
@@ -129,6 +138,7 @@ def discover_team_season_ids(
     *,
     contest_ids: list[str] | None = None,
     stat_seq: int | None = None,
+    ranking_period: int | None = None,
     max_contests: int = 30,
 ) -> dict[str, str]:
     """Build a ``{team_name: stats_ncaa_team_id}`` mapping for one season.
@@ -139,28 +149,29 @@ def discover_team_season_ids(
     ----------
     contest_ids:
         List of NCAA contest IDs (from the games table) to probe via
-        ``CONTEST_STATS_URL``.  Pass at most ``max_contests`` to limit
-        network traffic; the contest pages cover two teams each so even a
-        small sample yields most teams in a season.
+        ``CONTEST_STATS_URL``.  Covers two teams per request; ~30 games is
+        enough for a full D1 field.
     stat_seq:
-        When provided, the national rankings page is also fetched.  This
-        covers the full division in one request, but requires knowing the
-        sport-specific stat_seq (see ``WSB_D1_RANKING_STAT_SEQ`` in config).
+        When provided alongside ``ranking_period``, the national rankings page
+        is also fetched — covers the full division in one request.
+        ``stat_seq=271`` is batting average for WSB (stable across years).
+    ranking_period:
+        Year-specific period ID for the rankings page (e.g. 113 for WSB 2026).
+        See ``WSB_D1_RANKING_PERIOD`` in config.py.
     max_contests:
-        Upper bound on how many contest pages to fetch (default 30, which
-        covers ~60 team appearances — enough for a full D1 field).
+        Upper bound on contest pages to fetch (default 30).
     """
     results: dict[str, str] = {}
 
     # Path 1: per-game pages (no extra config needed).
     if contest_ids:
-        for cid in (contest_ids[:max_contests]):
+        for cid in contest_ids[:max_contests]:
             found = _discover_via_contest(str(cid))
             results.update(found)
 
     # Path 2: national rankings page (covers 100 % of teams in one fetch).
-    if stat_seq is not None:
-        results.update(_discover_via_ranking(year, division_id, stat_seq))
+    if stat_seq is not None and ranking_period is not None:
+        results.update(_discover_via_ranking(year, division_id, stat_seq, ranking_period))
 
     log.info(
         "discover_team_season_ids year=%s: found %d teams total", year, len(results)

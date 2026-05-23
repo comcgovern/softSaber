@@ -26,7 +26,7 @@ import logging
 import pandas as pd
 
 from .. import storage
-from ..config import WSB_D1_RANKING_STAT_SEQ
+from ..config import WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
 from . import ncaa_stats
 
 log = logging.getLogger(__name__)
@@ -46,14 +46,15 @@ def discover_and_update_teams(
     Returns the updated teams DataFrame with a ``stats_ncaa_team_id`` column.
     """
     contest_ids = games["game_id"].astype(str).tolist()
-    stat_seq = WSB_D1_RANKING_STAT_SEQ.get(year)
+    ranking_period = WSB_D1_RANKING_PERIOD.get(year)
 
     division_id = 1  # D1 hardcoded; extend via Season.division_code if needed
     id_map = ncaa_stats.discover_team_season_ids(
         year,
         division_id=division_id,
         contest_ids=contest_ids,
-        stat_seq=stat_seq,
+        stat_seq=WSB_D1_RANKING_STAT_SEQ,
+        ranking_period=ranking_period,
     )
 
     if not id_map:

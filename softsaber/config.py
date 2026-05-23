@@ -18,16 +18,22 @@ DIVISION_CODES: dict[str, int] = {"D1": 1, "D2": 2, "D3": 3}
 TARGET_SEASONS: tuple[int, ...] = (2024, 2025, 2026)
 TARGET_DIVISION: str = "D1"
 
-# stats.ncaa.org national ranking page stat_seq values for WSB Division I.
-# These are sport-specific category IDs used in the ranking URL's stat_seq param.
-# Validate against: https://stats.ncaa.org/rankings/national_ranking
-# (sport_code=WSB, division=1, pick any stat, note the stat_seq in the URL).
-# Once known, filling these in enables the full-division single-fetch discovery
-# path in ncaa_stats.discover_team_season_ids().
-WSB_D1_RANKING_STAT_SEQ: dict[int, int | None] = {
-    2024: None,  # TODO: confirm by inspecting a live ranking URL
-    2025: None,  # TODO: confirm
-    2026: None,  # TODO: confirm
+# stats.ncaa.org national ranking page parameters for WSB Division I.
+#
+# stat_seq=271 is batting average for WSB — confirmed from:
+#   https://stats.ncaa.org/rankings/national_ranking?academic_year=2026.0
+#     &division=1.0&ranking_period=113.0&sport_code=WSB&stat_seq=271.0
+# stat_seq appears stable across years for the same sport/stat category.
+#
+# ranking_period is year-specific (the end-of-season period ID for that year).
+# 2026 confirmed = 113. Fill in 2024/2025 by visiting the ranking page for
+# those years and noting the ranking_period value in the URL.
+WSB_D1_RANKING_STAT_SEQ: int = 271
+
+WSB_D1_RANKING_PERIOD: dict[int, int | None] = {
+    2024: None,  # TODO: inspect ranking URL for 2024 and note ranking_period
+    2025: None,  # TODO: inspect ranking URL for 2025
+    2026: 113,   # confirmed
 }
 
 USER_AGENT = (
