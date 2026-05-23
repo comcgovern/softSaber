@@ -169,10 +169,11 @@ def ingest_season(season: Season) -> pd.DataFrame:
         try:
             day_games = fetch_day(season, d)
         except Exception as e:  # noqa: BLE001 — keep ingesting other days
-            log.warning("scoreboard %s failed: %s", d, e)
+            log.warning("scoreboard %s failed: %s", d, e, exc_info=log.isEnabledFor(logging.DEBUG))
             continue
         all_games.extend(day_games)
         log.info("scoreboard %s: %d games", d, len(day_games))
+        log.debug("scoreboard %s: running total %d games", d, len(all_games))
 
     df = pd.DataFrame([g.__dict__ for g in all_games])
     df["season"] = season.year
