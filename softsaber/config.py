@@ -19,13 +19,8 @@ DIVISION_IDS: dict[tuple[str, int], int] = {
     ("D1", 2022): 17840,
     ("D1", 2023): 18101,
     ("D1", 2024): 18261,
-    # TODO(2025/2026): confirm by probing
-    #   https://stats.ncaa.org/rankings/national_ranking?academic_year=2025...
-    # or by inspecting a 2025 scoreboard URL once a known game date is loaded.
-    # Placeholders below are guesses based on the ~+160/year increment pattern
-    # observed for D1 (17540 → 17840 → 18101 → 18261). Treat as unconfirmed.
-    ("D1", 2025): 18420,
-    ("D1", 2026): 18580,
+    ("D1", 2025): 18503,
+    ("D1", 2026): 18763,
 }
 
 # Default focus per the project plan.
