@@ -9,6 +9,7 @@ description = "Advanced softball analytics (park factors, linear weights, wRC+) 
 requires-python = ">=3.10"
 dependencies = [
     "requests>=2.31",
+    "curl_cffi>=0.7",
     "lxml>=5.0",
     "beautifulsoup4>=4.12",
     "pandas>=2.1",
