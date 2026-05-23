@@ -10,6 +10,7 @@ Examples::
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Annotated
 
 import typer
@@ -37,11 +38,27 @@ def _setup_logging(verbose: bool) -> None:
 def ingest_scoreboard(
     season: Annotated[int, typer.Option(help="Season year, e.g. 2024.")] = 2024,
     division: Annotated[str, typer.Option(help="D1/D2/D3")] = TARGET_DIVISION,
+    day: Annotated[
+        str | None,
+        typer.Option(
+            "--date",
+            help="Single date (YYYY-MM-DD) to ingest instead of the full season. "
+            "Useful for smoke-testing without a full-season scrape.",
+        ),
+    ] = None,
     verbose: bool = False,
 ) -> None:
-    """Walk a season's scoreboard and write ``data/processed/games/<year>.parquet``."""
+    """Walk a season's scoreboard (or one day) and write a ``games`` partition."""
     _setup_logging(verbose)
-    df = scoreboard_mod.ingest_season(Season(season, division))
+    sn = Season(season, division)
+    if day:
+        try:
+            d = datetime.strptime(day, "%Y-%m-%d").date()
+        except ValueError as e:
+            raise typer.BadParameter(f"--date must be YYYY-MM-DD: {e}") from None
+        df = scoreboard_mod.ingest_date(sn, d)
+    else:
+        df = scoreboard_mod.ingest_season(sn)
     typer.echo(f"games written: {len(df)}")
 
 
