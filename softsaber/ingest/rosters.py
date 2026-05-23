@@ -1,75 +1,134 @@
-"""Roster ingest — needed to map batter-name strings in PBP back to player IDs.
+"""Season roster ingest, bridging the teams table to stats.ncaa.org roster pages.
 
-stats.ncaa.org exposes a roster page per team-season at
-``/teams/{softball_id}/roster`` (the exact path is what softballR's
-``load_ncaa_softball_rosters`` resolves under the hood). The roster gives us
-jersey number, full name, position, class, and a player-level ID we'll need
-for season aggregation later.
+The pipeline has two steps:
 
-This module is left as a small functional stub: the canonical URL pattern is
-recorded here, and we wire up a parquet writer with the expected schema so
-the stats layer can be developed against fixtures while we firm up the
-scraping details against a real page.
+1. **ID discovery** — call :func:`ncaa_stats.discover_team_season_ids` with the
+   game ``contestId`` list from the games table.  This fetches per-game stats
+   pages on stats.ncaa.org and parses ``/teams/{year_specific_id}`` links.
+   The resulting ``{team_name: stats_ncaa_team_id}`` map is joined to the teams
+   table and written back to disk.
+
+2. **Roster fetch** — for each team with a known ``stats_ncaa_team_id``, fetch
+   ``stats.ncaa.org/teams/{id}/roster`` and parse player rows.  Each player row
+   carries a ``ncaa_player_id`` from the ``/player/{id}`` link, giving us a
+   global, stable player identifier we can join across seasons and back to PBP.
+
+Output parquet schema (``rosters/{season}``):
+
+    season, team_name, stats_ncaa_team_id,
+    ncaa_player_id, player_name, jersey, position, class_year
 """
 
 from __future__ import annotations
 
-import io
 import logging
 
 import pandas as pd
 
 from .. import storage
-from ..http_cache import fetch
+from ..config import WSB_D1_RANKING_STAT_SEQ
+from . import ncaa_stats
 
 log = logging.getLogger(__name__)
 
-ROSTER_URL_FMT = "https://stats.ncaa.org/teams/{softball_id}/roster"
 
+def discover_and_update_teams(
+    teams: pd.DataFrame,
+    games: pd.DataFrame,
+    year: int,
+) -> pd.DataFrame:
+    """Discover ``stats_ncaa_team_id`` for each team and write an updated teams table.
 
-def fetch_team_roster(softball_id: str, season: int) -> pd.DataFrame:
-    """Fetch a single team's roster table.
+    Uses ``contestId`` values from ``games`` as the primary discovery path
+    (no config needed) and falls back to the national ranking page when
+    ``WSB_D1_RANKING_STAT_SEQ[year]`` is configured.
 
-    NOTE: The exact column set varies year to year as NCAA updates the page.
-    We normalize to a minimal schema here and pass through any extras as
-    columns prefixed with ``raw_``.
+    Returns the updated teams DataFrame with a ``stats_ncaa_team_id`` column.
     """
-    url = ROSTER_URL_FMT.format(softball_id=softball_id)
-    html = fetch(url, namespace=f"roster/{season}")
-    tables = pd.read_html(io.StringIO(html))
-    if not tables:
-        log.warning("roster %s: no tables found", softball_id)
+    contest_ids = games["game_id"].astype(str).tolist()
+    stat_seq = WSB_D1_RANKING_STAT_SEQ.get(year)
+
+    division_id = 1  # D1 hardcoded; extend via Season.division_code if needed
+    id_map = ncaa_stats.discover_team_season_ids(
+        year,
+        division_id=division_id,
+        contest_ids=contest_ids,
+        stat_seq=stat_seq,
+    )
+
+    if not id_map:
+        log.warning(
+            "year %s: no stats_ncaa_team_id found — roster fetch will be skipped. "
+            "If the contest pages returned 404s, check that CONTEST_STATS_URL is "
+            "correct for the current NCAA site layout.",
+            year,
+        )
+        teams = teams.copy()
+        if "stats_ncaa_team_id" not in teams.columns:
+            teams["stats_ncaa_team_id"] = None
+        return teams
+
+    teams = teams.copy()
+    teams["stats_ncaa_team_id"] = teams["team_name"].map(id_map)
+    matched = teams["stats_ncaa_team_id"].notna().sum()
+    log.info(
+        "year %s: matched stats_ncaa_team_id for %d/%d teams",
+        year,
+        matched,
+        len(teams),
+    )
+
+    storage.write_partition("teams", str(year), teams)
+    return teams
+
+
+def ingest_season_rosters(
+    teams: pd.DataFrame,
+    year: int,
+) -> pd.DataFrame:
+    """Fetch rosters for all teams that have a known ``stats_ncaa_team_id``.
+
+    ``teams`` must have ``team_name`` and ``stats_ncaa_team_id`` columns
+    (populated by :func:`discover_and_update_teams`).
+
+    Writes ``rosters/{year}.parquet`` and returns the combined DataFrame.
+    """
+    if "stats_ncaa_team_id" not in teams.columns:
+        log.warning("teams table has no stats_ncaa_team_id — run discover first")
         return pd.DataFrame()
 
-    df = tables[0].copy()
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    rename = {
-        "jersey": "jersey",
-        "player": "player_name",
-        "name": "player_name",
-        "pos": "position",
-        "position": "position",
-        "yr": "class_year",
-        "class": "class_year",
-    }
-    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-    df["softball_id"] = softball_id
-    df["season"] = season
-    return df
+    eligible = teams[teams["stats_ncaa_team_id"].notna()].copy()
+    if eligible.empty:
+        log.warning("no teams with stats_ncaa_team_id for year %s", year)
+        return pd.DataFrame()
+
+    frames: list[pd.DataFrame] = []
+    total = len(eligible)
+    for i, row in enumerate(eligible.itertuples(index=False), 1):
+        tid = str(row.stats_ncaa_team_id)
+        log.debug("roster %s (%d/%d)", row.team_name, i, total)
+        df = ncaa_stats.fetch_team_roster(tid, year)
+        if df.empty:
+            continue
+        df["team_name"] = row.team_name
+        df["stats_ncaa_team_id"] = tid
+        df["season"] = year
+        frames.append(df)
+
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    if not combined.empty:
+        # Normalise columns to the canonical schema — extras are kept as-is.
+        for col in ("ncaa_player_id", "player_name", "jersey", "position", "class_year"):
+            if col not in combined.columns:
+                combined[col] = None
+        storage.write_partition("rosters", str(year), combined)
+        log.info("rosters year=%s: wrote %d player rows", year, len(combined))
+
+    return combined
 
 
-def ingest_season_rosters(team_ids: pd.DataFrame, season: int) -> pd.DataFrame:
-    """``team_ids`` must have columns ``softball_id`` and ``team_name``."""
-    frames = []
-    for _, row in team_ids.iterrows():
-        try:
-            r = fetch_team_roster(str(row["softball_id"]), season)
-            if not r.empty:
-                r["team_name"] = row["team_name"]
-                frames.append(r)
-        except Exception as e:  # noqa: BLE001
-            log.warning("roster team %s failed: %s", row["softball_id"], e, exc_info=log.isEnabledFor(logging.DEBUG))
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if not df.empty:
-        storage.write_partition("rosters", str(season), df)
-    return df
+__all__ = [
+    "discover_and_update_teams",
+    "ingest_season_rosters",
+]

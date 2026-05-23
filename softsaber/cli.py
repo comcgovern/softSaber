@@ -22,6 +22,7 @@ import typer
 from .config import Season, TARGET_DIVISION, TARGET_SEASONS
 from .ingest import boxscore as boxscore_mod
 from .ingest import pbp as pbp_mod
+from .ingest import rosters as rosters_mod
 from .ingest import scoreboard as scoreboard_mod
 from .ingest import teams as teams_mod
 
@@ -207,6 +208,44 @@ def ingest_all(
         teams_mod.build_teams_table(softball_ids, year)
         pbp_mod.ingest_season_pbp(games, year)
         boxscore_mod.ingest_boxscores_for_games(games, partition=str(year))
+
+
+@ingest_app.command("rosters")
+def ingest_rosters(
+    season: Annotated[int | None, typer.Option(help="Season year.")] = None,
+    day: Annotated[
+        str | None,
+        typer.Option("--date", help="Infer season year from this date (YYYY-MM-DD)."),
+    ] = None,
+    verbose: bool = False,
+) -> None:
+    """Discover stats.ncaa.org team IDs and fetch per-player rosters.
+
+    Reads the games and teams partitions for the season, probes the
+    stats.ncaa.org individual-stats pages for each game to discover
+    year-specific team IDs, then fetches each team's roster page to get
+    player names and NCAA player IDs.
+
+    Writes an updated ``teams/{season}.parquet`` (with ``stats_ncaa_team_id``)
+    and a ``rosters/{season}.parquet`` (one row per player).
+
+    Tip: fill in ``WSB_D1_RANKING_STAT_SEQ`` in ``config.py`` to enable
+    full-division discovery in a single request instead of per-game pages.
+    """
+    from . import storage
+
+    _setup_logging(verbose)
+    d = _parse_date(day) if day else None
+    year = _resolve_season(season, d, "ingest rosters")
+
+    games, _ = _games_for(year, d)
+    teams = storage.read_table("teams", partitions=[str(year)])
+    if teams.empty:
+        raise SystemExit(f"no teams partition for {year} — run `ingest teams` first")
+
+    teams = rosters_mod.discover_and_update_teams(teams, games, year)
+    df = rosters_mod.ingest_season_rosters(teams, year)
+    typer.echo(f"roster rows written: {len(df)}")
 
 
 @stats_app.command("wrc")

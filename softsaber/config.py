@@ -18,6 +18,18 @@ DIVISION_CODES: dict[str, int] = {"D1": 1, "D2": 2, "D3": 3}
 TARGET_SEASONS: tuple[int, ...] = (2024, 2025, 2026)
 TARGET_DIVISION: str = "D1"
 
+# stats.ncaa.org national ranking page stat_seq values for WSB Division I.
+# These are sport-specific category IDs used in the ranking URL's stat_seq param.
+# Validate against: https://stats.ncaa.org/rankings/national_ranking
+# (sport_code=WSB, division=1, pick any stat, note the stat_seq in the URL).
+# Once known, filling these in enables the full-division single-fetch discovery
+# path in ncaa_stats.discover_team_season_ids().
+WSB_D1_RANKING_STAT_SEQ: dict[int, int | None] = {
+    2024: None,  # TODO: confirm by inspecting a live ranking URL
+    2025: None,  # TODO: confirm
+    2026: None,  # TODO: confirm
+}
+
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
