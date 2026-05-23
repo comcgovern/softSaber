@@ -1,8 +1,8 @@
-"""Round-trip test for the GraphQL scoreboard parser.
+"""Round-trip test for the casablanca scoreboard parser.
 
 Uses a minimal payload that matches the relevant subset of the
-sdataprod.ncaa.com scoreboard response. If NCAA changes the shape, this test
-fails before the real ingest does.
+``data.ncaa.com/casablanca/scoreboard/.../scoreboard.json`` response. If NCAA
+changes the shape, this test fails before the real ingest does.
 """
 
 from __future__ import annotations
@@ -10,39 +10,35 @@ from __future__ import annotations
 from softsaber.ingest.scoreboard import parse_scoreboard
 
 FIXTURE = {
-    "data": {
-        "contests": [
-            {
-                "contestId": 1234567,
-                "startDate": "2024-03-15",
-                "gameState": "F",
-                "teams": [
-                    {
-                        "isHome": False,
-                        "teamId": 30001,
-                        "nameShort": "Oklahoma",
-                        "score": 5,
-                    },
-                    {
-                        "isHome": True,
-                        "teamId": 30002,
-                        "nameShort": "Texas",
-                        "score": 3,
-                    },
-                ],
-            },
-            {
-                # Live game — should be excluded by default.
-                "contestId": 1234568,
-                "startDate": "2024-03-15",
-                "gameState": "I",
-                "teams": [
-                    {"isHome": False, "teamId": 1, "nameShort": "A", "score": 1},
-                    {"isHome": True, "teamId": 2, "nameShort": "B", "score": 0},
-                ],
-            },
-        ]
-    }
+    "games": [
+        {
+            "game": {
+                "gameID": "1234567",
+                "startDate": "03/15/2024",
+                "gameState": "final",
+                "away": {
+                    "score": "5",
+                    "teamId": "30001",
+                    "names": {"short": "Oklahoma", "seo": "oklahoma"},
+                },
+                "home": {
+                    "score": "3",
+                    "teamId": "30002",
+                    "names": {"short": "Texas", "seo": "texas"},
+                },
+            }
+        },
+        {
+            # Live game — should be excluded by default.
+            "game": {
+                "gameID": "1234568",
+                "startDate": "03/15/2024",
+                "gameState": "live",
+                "away": {"score": "1", "names": {"short": "A", "seo": "a"}},
+                "home": {"score": "0", "names": {"short": "B", "seo": "b"}},
+            }
+        },
+    ]
 }
 
 
@@ -60,6 +56,25 @@ def test_parse_scoreboard_minimal() -> None:
     assert g.status == "Final"
 
 
+def test_parse_scoreboard_team_id_falls_back_to_seo() -> None:
+    payload = {
+        "games": [
+            {
+                "game": {
+                    "gameID": "9",
+                    "startDate": "03/15/2024",
+                    "gameState": "final",
+                    "away": {"score": "1", "names": {"short": "A", "seo": "a-slug"}},
+                    "home": {"score": "0", "names": {"short": "B", "seo": "b-slug"}},
+                }
+            }
+        ]
+    }
+    [g] = parse_scoreboard(payload)
+    assert g.away_team_id == "a-slug"
+    assert g.home_team_id == "b-slug"
+
+
 def test_parse_scoreboard_empty_payload() -> None:
     assert parse_scoreboard({}) == []
-    assert parse_scoreboard({"data": {"contests": []}}) == []
+    assert parse_scoreboard({"games": []}) == []

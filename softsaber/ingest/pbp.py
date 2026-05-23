@@ -1,15 +1,15 @@
-"""Play-by-play ingest from NCAA's GraphQL API.
+"""Play-by-play ingest from the ncaa-api.henrygd.me REST wrapper.
 
-One GraphQL call per contestId returns ``data.playbyplay.periods[]`` where
-each period is an inning containing a ``playbyplayStats`` list of play
-objects. We flatten that into the row shape the parse layer consumes:
+One call per gameId returns a payload with ``periods[]`` where each period
+is an inning containing a list of play objects (``playbyplayStats`` from
+the GraphQL backend, or ``plays`` from henrygd's scrape — both shapes are
+handled). We flatten that into the row shape the parse layer consumes:
 
     game_id, inning, top_bottom, batting_team, fielding_team,
     away_team_runs, home_team_runs, events, play_id, row_idx
 
-**Field-name caveat:** NCAA does not publish a schema for this GraphQL type
-and the wrapper projects (henrygd, etc.) only assert that ``periods`` and
-``playbyplayStats`` exist — not the names of individual play fields. The
+**Field-name caveat:** NCAA does not publish a schema for this data and
+the per-play field names drift between the upstream sources. The
 candidate names below are reasonable guesses; the flattener logs the keys
 it actually sees the first time it can't find what it expects so we can
 tune from real data without another scrape.
@@ -68,15 +68,35 @@ def _half_inning(period: dict[str, Any]) -> tuple[str, str]:
     return ("top", "top")  # caller resolves per-play; helper kept for symmetry
 
 
+def _find_periods(payload: dict[str, Any]) -> list[Any]:
+    """Pull the ``periods`` list out of a PBP payload, tolerating shape drift.
+
+    henrygd's REST wrapper puts ``periods`` at the top level; the older
+    GraphQL backend nested it under ``data.playbyplay``. Check both, plus a
+    couple of related variants.
+    """
+    if not payload:
+        return []
+    if isinstance(payload.get("periods"), list):
+        return payload["periods"]
+    data = payload.get("data") or {}
+    if isinstance(data, dict):
+        pbp = data.get("playbyplay") or data.get("playByPlay") or {}
+        if isinstance(pbp, dict) and isinstance(pbp.get("periods"), list):
+            return pbp["periods"]
+        if isinstance(data.get("periods"), list):
+            return data["periods"]
+    return []
+
+
 def flatten_pbp(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
-    """Turn one GraphQL PBP payload into a flat DataFrame.
+    """Turn one PBP payload into a flat DataFrame.
 
     Returns an empty frame (no rows, no columns) if the response shape is
     unrecognized or contains no plays — same contract as the previous HTML
     implementation, so the ``ingest_season_pbp`` driver can treat it uniformly.
     """
-    pbp = ((payload or {}).get("data") or {}).get("playbyplay") or {}
-    periods = pbp.get("periods") or []
+    periods = _find_periods(payload)
     if not periods:
         log.debug("game %s: no periods in payload", game_id)
         return pd.DataFrame()
@@ -95,7 +115,9 @@ def flatten_pbp(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
 
         # Two shapes seen in NCAA generic-PBP: (a) flat list of plays with a
         # per-play "home batting" flag, (b) split into half-inning sub-arrays.
-        plays = period.get("playbyplayStats")
+        # henrygd's REST wrapper labels the array ``plays``; the GraphQL
+        # backend used ``playbyplayStats``.
+        plays = period.get("plays") or period.get("playbyplayStats")
         if isinstance(plays, dict):
             # Shape (b): {"top": [...], "bottom": [...]} or {"away": [...], "home": [...]}.
             buckets = [
@@ -191,8 +213,14 @@ def _attach_team_names(pbp: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
     return pbp
 
 
-def ingest_season_pbp(games: pd.DataFrame, season: int) -> pd.DataFrame:
-    """Pull PBP for every finalized game in ``games`` and write a parquet partition."""
+def ingest_pbp_for_games(
+    games: pd.DataFrame, season: int, partition: str
+) -> pd.DataFrame:
+    """Pull PBP for every game in ``games`` and write a parquet partition.
+
+    ``partition`` controls the on-disk file name under ``pbp_raw/`` (e.g.
+    ``"2024"`` for a full season, ``"2024-05-04"`` for a single day).
+    """
     frames: list[pd.DataFrame] = []
     game_ids = games["game_id"].astype(str).tolist()
     total = len(game_ids)
@@ -205,8 +233,18 @@ def ingest_season_pbp(games: pd.DataFrame, season: int) -> pd.DataFrame:
     if not df.empty:
         df = _attach_team_names(df, games)
         df["season"] = season
-        storage.write_partition("pbp_raw", str(season), df)
+        storage.write_partition("pbp_raw", partition, df)
     return df
 
 
-__all__ = ["fetch_game_pbp", "flatten_pbp", "ingest_season_pbp"]
+def ingest_season_pbp(games: pd.DataFrame, season: int) -> pd.DataFrame:
+    """Pull PBP for every finalized game in ``games`` (full-season partition)."""
+    return ingest_pbp_for_games(games, season, str(season))
+
+
+__all__ = [
+    "fetch_game_pbp",
+    "flatten_pbp",
+    "ingest_pbp_for_games",
+    "ingest_season_pbp",
+]

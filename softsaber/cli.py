@@ -3,24 +3,30 @@
 Examples::
 
     softsaber ingest scoreboard --season 2024
-    softsaber ingest pbp --season 2024
+    softsaber ingest scoreboard --date 2024-05-04
+    softsaber ingest pbp --date 2024-05-04
+    softsaber ingest boxscore --date 2024-05-04
     softsaber ingest all --seasons 2024 2025 2026
+    softsaber ingest all --date 2024-05-04
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import date, datetime
 from typing import Annotated
 
+import pandas as pd
 import typer
 
 from .config import Season, TARGET_DIVISION, TARGET_SEASONS
+from .ingest import boxscore as boxscore_mod
 from .ingest import pbp as pbp_mod
 from .ingest import scoreboard as scoreboard_mod
 from .ingest import teams as teams_mod
 
 app = typer.Typer(help="Softball analytics ingest + stats CLI.")
-ingest_app = typer.Typer(help="Pull data from NCAA's GraphQL API (sdataprod.ncaa.com).")
+ingest_app = typer.Typer(help="Pull data from ncaa-api.henrygd.me.")
 stats_app = typer.Typer(help="Compute advanced stats from processed PBP.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(stats_app, name="stats")
@@ -33,15 +39,68 @@ def _setup_logging(verbose: bool) -> None:
     )
 
 
+def _parse_date(s: str) -> date:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError as e:
+        raise typer.BadParameter(f"--date must be YYYY-MM-DD: {e}") from None
+
+
+def _resolve_season(season: int | None, day: date | None, ctx: str) -> int:
+    """Pick the season year from ``--season`` or fall back to ``--date.year``.
+
+    ``--season`` and ``--date`` are mutually informative: if a date is given,
+    its year IS the season, so requiring both would be redundant. Raises if
+    neither is provided.
+    """
+    if season is not None:
+        return season
+    if day is not None:
+        return day.year
+    raise typer.BadParameter(f"{ctx}: pass --season or --date")
+
+
+def _date_partition(season: int, day: date) -> str:
+    return f"{season}-{day.month:02d}-{day.day:02d}"
+
+
+def _games_for(season: int, day: date | None) -> tuple[pd.DataFrame, str]:
+    """Read the games partition (single-day or full-season) for downstream ingests."""
+    from . import storage
+
+    partition = _date_partition(season, day) if day else str(season)
+    games = storage.read_table("games", partitions=[partition])
+    if games.empty:
+        hint = f"--date {day.isoformat()}" if day else f"--season {season}"
+        raise SystemExit(
+            f"no games partition for {partition} — run `ingest scoreboard {hint}` first"
+        )
+    return games, partition
+
+
 @ingest_app.command("scoreboard")
 def ingest_scoreboard(
-    season: Annotated[int, typer.Option(help="Season year, e.g. 2024.")] = 2024,
+    season: Annotated[
+        int | None,
+        typer.Option(help="Season year, e.g. 2024. Required unless --date is given."),
+    ] = None,
     division: Annotated[str, typer.Option(help="D1/D2/D3")] = TARGET_DIVISION,
+    day: Annotated[
+        str | None,
+        typer.Option(
+            "--date",
+            help="Single date (YYYY-MM-DD) to ingest. Season is inferred from "
+            "the year if --season isn't passed.",
+        ),
+    ] = None,
     verbose: bool = False,
 ) -> None:
-    """Walk a season's scoreboard and write ``data/processed/games/<year>.parquet``."""
+    """Walk a season's scoreboard (or one day) and write a ``games`` partition."""
     _setup_logging(verbose)
-    df = scoreboard_mod.ingest_season(Season(season, division))
+    d = _parse_date(day) if day else None
+    year = _resolve_season(season, d, "ingest scoreboard")
+    sn = Season(year, division)
+    df = scoreboard_mod.ingest_date(sn, d) if d else scoreboard_mod.ingest_season(sn)
     typer.echo(f"games written: {len(df)}")
 
 
@@ -65,37 +124,89 @@ def ingest_teams(
 
 @ingest_app.command("pbp")
 def ingest_pbp(
-    season: int = 2024,
+    season: Annotated[int | None, typer.Option(help="Season year. Required unless --date is given.")] = None,
+    day: Annotated[
+        str | None,
+        typer.Option("--date", help="Single date (YYYY-MM-DD). Season inferred from year."),
+    ] = None,
     verbose: bool = False,
 ) -> None:
-    """Pull play-by-play for every game in the season partition."""
+    """Pull play-by-play for every game in the matching games partition."""
     _setup_logging(verbose)
-    from . import storage
-
-    games = storage.read_table("games", partitions=[str(season)])
-    if games.empty:
-        raise SystemExit(f"no games partition for {season} — run `ingest scoreboard` first")
-    df = pbp_mod.ingest_season_pbp(games, season)
+    d = _parse_date(day) if day else None
+    year = _resolve_season(season, d, "ingest pbp")
+    games, partition = _games_for(year, d)
+    df = pbp_mod.ingest_pbp_for_games(games, year, partition)
     typer.echo(f"pbp rows written: {len(df)}")
+
+
+@ingest_app.command("boxscore")
+def ingest_boxscore(
+    season: Annotated[int | None, typer.Option(help="Season year. Required unless --date is given.")] = None,
+    day: Annotated[
+        str | None,
+        typer.Option("--date", help="Single date (YYYY-MM-DD). Season inferred from year."),
+    ] = None,
+    verbose: bool = False,
+) -> None:
+    """Warm the boxscore cache for every game in the matching games partition.
+
+    Boxscores aren't parsed into parquet yet — this just populates the raw
+    JSON cache (``data/raw/ncaa_api/boxscore/``) for downstream use.
+    """
+    _setup_logging(verbose)
+    d = _parse_date(day) if day else None
+    year = _resolve_season(season, d, "ingest boxscore")
+    games, _ = _games_for(year, d)
+    n = boxscore_mod.ingest_boxscores_for_games(games)
+    typer.echo(f"boxscores cached: {n}")
 
 
 @ingest_app.command("all")
 def ingest_all(
-    seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
+    seasons: Annotated[
+        list[int] | None,
+        typer.Option("--seasons", "-s", help="Season years. Required unless --date is given."),
+    ] = None,
     division: str = TARGET_DIVISION,
+    day: Annotated[
+        str | None,
+        typer.Option(
+            "--date",
+            help="Single date (YYYY-MM-DD) to run end-to-end. Season inferred from year; "
+            "--seasons is ignored if set.",
+        ),
+    ] = None,
     verbose: bool = False,
 ) -> None:
-    """End-to-end ingest for one or more seasons (scoreboard → teams → pbp)."""
+    """End-to-end ingest (scoreboard → teams → pbp → boxscore) for seasons or one day."""
     _setup_logging(verbose)
     from . import storage
 
-    for year in seasons:
+    if day:
+        d = _parse_date(day)
+        sn = Season(d.year, division)
+        partition = _date_partition(d.year, d)
+        scoreboard_mod.ingest_date(sn, d)
+        games = storage.read_table("games", partitions=[partition])
+        if games.empty:
+            typer.echo(f"no games found for {d.isoformat()}; stopping")
+            return
+        softball_ids = scoreboard_mod.discover_team_softball_ids(games)
+        teams_mod.build_teams_table(softball_ids, d.year)
+        pbp_mod.ingest_pbp_for_games(games, d.year, partition)
+        boxscore_mod.ingest_boxscores_for_games(games)
+        return
+
+    years = seasons if seasons else list(TARGET_SEASONS)
+    for year in years:
         sn = Season(year, division)
         scoreboard_mod.ingest_season(sn)
         games = storage.read_table("games", partitions=[str(year)])
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
         teams_mod.build_teams_table(softball_ids, year)
         pbp_mod.ingest_season_pbp(games, year)
+        boxscore_mod.ingest_boxscores_for_games(games)
 
 
 @stats_app.command("wrc")
