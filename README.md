@@ -16,12 +16,11 @@ power hitter shows up well above 100 wRC+ while the league average is 100.
 | layer | module | status |
 |---|---|---|
 | HTTP cache + retries | `softsaber.http_cache` | done |
-| NCAA GraphQL client | `softsaber.ingest.ncaa_api` | done |
-| Scoreboard ingest (GraphQL) | `softsaber.ingest.scoreboard` | done |
-| Play-by-play ingest (GraphQL) | `softsaber.ingest.pbp` | done; per-play field names need confirmation on first real run |
-| Team scrape | `softsaber.ingest.teams` | done (stats.ncaa.org HTML; redundant with `teamId` from GraphQL, can be retired) |
+| Scoreboard scrape | `softsaber.ingest.scoreboard` | done |
+| Play-by-play scrape | `softsaber.ingest.pbp` | done |
+| Team scrape | `softsaber.ingest.teams` | done |
 | Roster scrape | `softsaber.ingest.rosters` | done (real-page tuning when needed) |
-| Player-box scrape | `softsaber.ingest.playerbox` | retire in favor of `ncaa_api.fetch_boxscore` |
+| Player-box scrape | `softsaber.ingest.playerbox` | needs `stat_seq` discovery |
 | Event classifier | `softsaber.parse.events` | done; expand corpus as real samples land |
 | Base-out reconstruction | `softsaber.parse.baserunners` | done |
 | PA-level table | `softsaber.parse.pa` | done |
@@ -33,11 +32,7 @@ power hitter shows up well above 100 wRC+ while the league average is 100.
 ## Architecture
 
 ```
-                 sdataprod.ncaa.com (GraphQL persisted queries)
-                              |
-                              v
-                     softsaber.ingest.ncaa_api
-                  (scoreboard / pbp / boxscore)
+                   stats.ncaa.org (HTML scrape)
                               |
                               v
                      softsaber.http_cache
@@ -47,7 +42,7 @@ power hitter shows up well above 100 wRC+ while the league average is 100.
         |                     |                     |
         v                     v                     v
    scoreboard               teams                 pbp
-  (games table)     (name → ncaa team_id)     (raw pbp rows)
+  (games table)        (id mapping)         (raw pbp rows)
                                                     |
                                                     v
                                        softsaber.parse.events
@@ -110,27 +105,21 @@ once.
 
 ## Open items / next steps
 
-1. **Confirm the GraphQL PBP shape on a real response.** The flatten layer in
-   `softsaber.ingest.pbp` tries a small ordered list of candidate field names
-   (`text`, `playText`, etc., plus `isHomeBatting` variants) and logs the
-   actual keys it sees once when none match. Run `softsaber ingest pbp` for
-   one season, grep the log for ``PBP shape:`` warnings, and add the real
-   field names to the constants at the top of that module.
-2. **Refresh persisted-query hashes if NCAA rotates them.** `ncaa_api.py`
-   carries three hashes (`HASH_SCOREBOARD`, `HASH_PBP_GENERIC`,
-   `HASH_BOXSCORE_SOFTBALL`). If a call ever returns
-   ``PersistedQueryNotFound``, view source on a game center page and copy
-   the new ``sha256Hash`` from the inlined ``__APOLLO_STATE__`` script.
-3. **Validate the events classifier against real PBP.** The synthetic test
-   corpus covers canonical phrasings; NCAA stringers will surface variants
-   we haven't seen. Failures appear as ``outcome=None`` rows in the PA build
-   log — easy to grep.
-4. **Retire or rewrite `ingest.teams` / `ingest.playerbox`.** The GraphQL
-   scoreboard already returns `teamId`, and `ncaa_api.fetch_boxscore` covers
-   per-player line totals, so both legacy stats.ncaa.org scrapers can be
-   replaced by a thin pass over cached payloads.
+1. **Confirm `division_id` for 2025 and 2026.** `softsaber.config.DIVISION_IDS`
+   has best-guess values from the observed +160/year pattern; verify by
+   probing a known-good game date.
+2. **Validate the events classifier against real PBP** once the scrape has
+   run. The synthetic test corpus covers the canonical phrasings; NCAA
+   stringers will surface phrasings we haven't seen. Failures appear as
+   ``outcome=None`` rows in the PA build log — easy to grep.
+3. **Discover `stat_seq` values** for the hitting and pitching national
+   rankings pages and fill in `softsaber.ingest.playerbox.HITTING_STAT_IDS`
+   and `PITCHING_STAT_IDS` so the playerbox sanity check is wired up.
+4. **Sanity-check aggregation against the playerbox.** Once #3 is done,
+   compare `compute_player_seasons` output to the NCAA-reported per-player
+   AVG/OBP/SLG for the same season. Any discrepancy points at a parsing bug.
 5. **Decide the venue key for park factors.** Right now we proxy venue by
    `home_team_id`, which is correct for ~95% of D1 teams but wrong for
-   teams that share a stadium / play neutral-site tournaments. If you want
-   true venue-level PFs we need the venue string from the boxscore payload
-   (likely under `data.boxscore.gameInfo` or similar).
+   teams that share a stadium / play neutral-site tournaments. If you
+   want true venue-level PFs we need to scrape the box score header
+   (which carries the venue string).
