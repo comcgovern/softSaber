@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 
 import requests
+from curl_cffi import requests as curl_requests
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -56,10 +57,17 @@ def _log_retry(retry_state) -> None:  # type: ignore[type-arg]
     reraise=True,
     stop=stop_after_attempt(REQUEST_RETRY_MAX),
     wait=wait_exponential(multiplier=REQUEST_RETRY_BASE_DELAY_S, min=2, max=30),
-    retry=retry_if_exception_type((requests.ConnectionError, requests.Timeout, FetchError)),
+    retry=retry_if_exception_type(
+        (
+            requests.ConnectionError,
+            requests.Timeout,
+            curl_requests.exceptions.RequestException,
+            FetchError,
+        )
+    ),
     before_sleep=_log_retry,
 )
-def _do_get(session: requests.Session, url: str) -> str:
+def _do_get(session: curl_requests.Session, url: str) -> str:
     resp = session.get(url, timeout=REQUEST_TIMEOUT_S)
     log.debug("GET %s → %d (%d bytes)", url, resp.status_code, len(resp.content))
     if resp.status_code == 429 or 500 <= resp.status_code < 600:
@@ -69,18 +77,28 @@ def _do_get(session: requests.Session, url: str) -> str:
     return resp.text
 
 
-_session: requests.Session | None = None
+_session: curl_requests.Session | None = None
 
 
-def session() -> requests.Session:
+def session() -> curl_requests.Session:
+    # stats.ncaa.org is fronted by a TLS-fingerprint-checking WAF (Akamai) that
+    # 403s plain Python clients. curl_cffi impersonates Chrome's JA3 so we look
+    # like a real browser at the TLS layer, not just in headers.
     global _session
     if _session is None:
-        s = requests.Session()
+        s = curl_requests.Session(impersonate="chrome124")
         s.headers.update(
             {
                 "User-Agent": USER_AGENT,
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Referer": "https://stats.ncaa.org/",
+                "Upgrade-Insecure-Requests": "1",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Fetch-User": "?1",
             }
         )
         _session = s
