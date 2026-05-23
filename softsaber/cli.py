@@ -150,10 +150,10 @@ def ingest_boxscore(
     ] = None,
     verbose: bool = False,
 ) -> None:
-    """Warm the boxscore cache for every game in the matching games partition.
+    """Fetch and parse boxscores for every game in the matching games partition.
 
-    Boxscores aren't parsed into parquet yet — this just populates the raw
-    JSON cache (``data/raw/ncaa_api/boxscore/``) for downstream use.
+    Populates the raw JSON cache (``data/raw/ncaa_api/boxscore/``) and writes
+    a ``game_players`` parquet partition with per-player batting/pitching lines.
     """
     _setup_logging(verbose)
     d = _parse_date(day) if day else None
