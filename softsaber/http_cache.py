@@ -38,9 +38,9 @@ class FetchError(RuntimeError):
     pass
 
 
-def _cache_path(url: str, namespace: str, ext: str = "html") -> Path:
+def _cache_path(url: str, namespace: str) -> Path:
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]
-    return RAW_DIR / namespace / f"{digest}.{ext}"
+    return RAW_DIR / namespace / f"{digest}.html"
 
 
 def _log_retry(retry_state) -> None:  # type: ignore[type-arg]
@@ -93,7 +93,7 @@ def session() -> curl_requests.Session:
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "en-US,en;q=0.5",
                 "Accept-Encoding": "gzip, deflate, br",
-                "Referer": "https://www.ncaa.com/",
+                "Referer": "https://stats.ncaa.org/",
                 "Upgrade-Insecure-Requests": "1",
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
@@ -105,14 +105,10 @@ def session() -> curl_requests.Session:
     return _session
 
 
-def fetch(url: str, *, namespace: str, force: bool = False, ext: str = "html") -> str:
-    """GET ``url`` with disk cache. ``namespace`` groups cached files by source.
-
-    ``ext`` controls the on-disk extension; use ``"json"`` for GraphQL responses
-    so files round-trip through ``json.loads`` without a comment prefix.
-    """
+def fetch(url: str, *, namespace: str, force: bool = False) -> str:
+    """GET ``url`` with disk cache. ``namespace`` groups cached files by source."""
     ensure_dirs()
-    path = _cache_path(url, namespace, ext=ext)
+    path = _cache_path(url, namespace)
     if path.exists() and not force:
         log.debug("cache hit %s", url)
         return path.read_text(encoding="utf-8")
@@ -120,11 +116,7 @@ def fetch(url: str, *, namespace: str, force: bool = False, ext: str = "html") -
     path.parent.mkdir(parents=True, exist_ok=True)
     log.info("fetch %s", url)
     text = _do_get(session(), url)
-    if ext == "html":
-        # Tag URL into HTML files so the cache is self-describing. Skip for
-        # JSON because the comment would break json.loads.
-        path.write_text(f"<!-- src: {url} -->\n{text}", encoding="utf-8")
-    else:
-        path.write_text(text, encoding="utf-8")
+    # Tag the URL into the file so cache contents are self-describing.
+    path.write_text(f"<!-- src: {url} -->\n{text}", encoding="utf-8")
     time.sleep(INTER_REQUEST_DELAY_S)
     return text

@@ -20,7 +20,7 @@ from .ingest import scoreboard as scoreboard_mod
 from .ingest import teams as teams_mod
 
 app = typer.Typer(help="Softball analytics ingest + stats CLI.")
-ingest_app = typer.Typer(help="Pull data from NCAA's GraphQL API (sdataprod.ncaa.com).")
+ingest_app = typer.Typer(help="Pull data from stats.ncaa.org.")
 stats_app = typer.Typer(help="Compute advanced stats from processed PBP.")
 app.add_typer(ingest_app, name="ingest")
 app.add_typer(stats_app, name="stats")

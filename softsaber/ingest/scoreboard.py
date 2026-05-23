@@ -1,25 +1,41 @@
-"""Season scoreboard ingest, via the NCAA GraphQL API.
+"""Season scoreboard ingest.
 
-For each calendar day in a season we hit ``sdataprod.ncaa.com`` and pull the
-list of contests, then keep the ones that are Final. The output is the join
-key for everything else: a ``games`` table keyed by ``game_id`` (NCAA's
-``contestId``) that points at the boxscore and play-by-play endpoints.
+For each calendar day in a season, hit the livestream scoreboard endpoint and
+extract one row per Final game. The output is the join key for everything
+else: a ``games`` table keyed by ``game_id`` that points at the box-score and
+play-by-play endpoints.
+
+URL pattern (from softballR):
+    https://stats.ncaa.org/season_divisions/{division_id}/livestream_scoreboards
+    ?utf8=%E2%9C%93&season_division_id=&game_date={M}%2F{D}%2F{YYYY}
+    &conference_id=0&tournament_id=&commit=Submit
+
+NCAA softball seasons run early-February through early-June, with the WCWS
+ending in the first week of June.
 """
 
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any, Iterable
+from typing import Iterable
 
 import pandas as pd
+from lxml import html as lxml_html
 
 from .. import storage
-from ..config import SPORT_CODE_SOFTBALL, Season
-from . import ncaa_api
+from ..config import Season
+from ..http_cache import fetch
 
 log = logging.getLogger(__name__)
+
+SCOREBOARD_URL_FMT = (
+    "https://stats.ncaa.org/season_divisions/{div_id}/livestream_scoreboards"
+    "?utf8=%E2%9C%93&season_division_id=&game_date={m}%2F{d}%2F{y}"
+    "&conference_id=0&tournament_id=&commit=Submit"
+)
 
 SEASON_WINDOWS: dict[int, tuple[date, date]] = {
     # Inclusive start/end. Tune per-year if regionals/WCWS dates shift.
@@ -49,58 +65,97 @@ def _iter_dates(start: date, end: date) -> Iterable[date]:
         d += timedelta(days=1)
 
 
-def _to_int(v: Any) -> int | None:
-    if v is None or v == "":
-        return None
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return None
+_RE_CONTEST_ID = re.compile(r'<tr id="contest_(\d+)"')
+_RE_LOGO_ALT = re.compile(
+    r'<img height="20px" width="30px" alt="([^"]+)" src="([^"]+)"'
+)
+_RE_TEAM_HREF = re.compile(
+    r'<a target="TEAMS_WIN" class="skipMask" href="/teams/(\d+)">'
+)
 
 
-def parse_scoreboard(payload: dict[str, Any], *, only_final: bool = True) -> list[GameRow]:
-    """Flatten one GraphQL scoreboard payload into ``GameRow``s.
+def parse_scoreboard(html: str) -> list[GameRow]:
+    """Parse the scoreboard HTML for one day into a list of finalized games.
 
-    Reads ``payload["data"]["contests"]``. Each contest has a ``teams`` array
-    with ``isHome`` discriminating sides; the ``gameState`` field is "F" for
-    finalized, "I" in-progress, "P" pre-game.
+    The page is awkward — softballR uses line-grep against raw HTML rather
+    than CSS because the markup has empty <td> placeholders for non-final
+    games. We do the same here.
     """
-    contests = ((payload or {}).get("data") or {}).get("contests") or []
+    # Each game block sits between successive ``<tr id="contest_...">`` rows.
+    lines = html.splitlines()
+    contest_lines: list[int] = [i for i, ln in enumerate(lines) if _RE_CONTEST_ID.search(ln)]
+    if not contest_lines:
+        return []
+
     games: list[GameRow] = []
-    for c in contests:
-        state = c.get("gameState") or ""
-        if only_final and state != "F":
+    # NCAA renders two ``<tr id="contest_X">`` per game (away row + home row)
+    # so we step by 2 and look ahead up to ~70 lines for the block.
+    for idx in range(0, len(contest_lines), 2):
+        start = contest_lines[idx]
+        end = (
+            contest_lines[idx + 2]
+            if idx + 2 < len(contest_lines)
+            else min(start + 70, len(lines))
+        )
+        block = "\n".join(lines[start:end])
+
+        if "Canceled" in block or "Ppd" in block:
             continue
-        teams = c.get("teams") or []
-        home = next((t for t in teams if t.get("isHome")), None)
-        away = next((t for t in teams if not t.get("isHome")), None)
-        if not home or not away:
-            log.debug("contest %s missing home/away split, skipping", c.get("contestId"))
+
+        m_id = _RE_CONTEST_ID.search(block)
+        if not m_id:
             continue
+        game_id = m_id.group(1)
+
+        team_alts = _RE_LOGO_ALT.findall(block)
+        team_hrefs = _RE_TEAM_HREF.findall(block)
+        if len(team_alts) < 2 or len(team_hrefs) < 2:
+            continue
+
+        # Score divs are emitted in away/home order. The score sits on the
+        # line *after* the ``<div id="score_..."``.
+        score_idxs = [i for i, ln in enumerate(lines[start:end]) if 'id="score_' in ln]
+        if len(score_idxs) < 2:
+            continue
+        away_runs = lines[start + score_idxs[0] + 1].strip()
+        home_runs = lines[start + score_idxs[1] + 1].strip()
+
+        status_idxs = [i for i, ln in enumerate(lines[start:end]) if 'class="livestream' in ln]
+        status = lines[start + status_idxs[0] + 1].strip() if status_idxs else ""
+        if status != "Final":
+            continue
+
+        # Date sits on the line after the rowspan=2 td.
+        date_idxs = [
+            i
+            for i, ln in enumerate(lines[start:end])
+            if '<td rowspan="2" valign="middle">' in ln
+        ]
+        game_date = lines[start + date_idxs[0] + 1].strip() if date_idxs else ""
+        game_date = re.sub(r"\s*\(\d\)|\s*<br/>\*If necessary", "", game_date)
+
         games.append(
             GameRow(
-                game_id=str(c.get("contestId") or ""),
-                game_date=str(c.get("startDate") or ""),
-                away_team=str(away.get("nameShort") or ""),
-                away_team_id=str(away.get("teamId") or away.get("seoname") or ""),
-                away_team_runs=_to_int(away.get("score")),
-                home_team=str(home.get("nameShort") or ""),
-                home_team_id=str(home.get("teamId") or home.get("seoname") or ""),
-                home_team_runs=_to_int(home.get("score")),
-                status="Final",
+                game_id=game_id,
+                game_date=game_date,
+                away_team=team_alts[0][0],
+                away_team_id=team_hrefs[0],
+                away_team_runs=int(away_runs) if away_runs.isdigit() else None,
+                home_team=team_alts[1][0],
+                home_team_id=team_hrefs[1],
+                home_team_runs=int(home_runs) if home_runs.isdigit() else None,
+                status=status,
             )
         )
     return games
 
 
 def fetch_day(season: Season, d: date) -> list[GameRow]:
-    payload = ncaa_api.fetch_scoreboard(
-        sport_code=SPORT_CODE_SOFTBALL,
-        division=season.division_code,
-        season_year=season.year,
-        contest_date=f"{d.year:04d}/{d.month:02d}/{d.day:02d}",
+    url = SCOREBOARD_URL_FMT.format(
+        div_id=season.division_id, m=d.month, d=d.day, y=d.year
     )
-    return parse_scoreboard(payload)
+    html = fetch(url, namespace=f"scoreboard/{season.year}")
+    return parse_scoreboard(html)
 
 
 def ingest_season(season: Season) -> pd.DataFrame:
@@ -118,6 +173,7 @@ def ingest_season(season: Season) -> pd.DataFrame:
             continue
         all_games.extend(day_games)
         log.info("scoreboard %s: %d games", d, len(day_games))
+        log.debug("scoreboard %s: running total %d games", d, len(all_games))
 
     df = pd.DataFrame([g.__dict__ for g in all_games])
     df["season"] = season.year
@@ -137,6 +193,7 @@ def discover_team_softball_ids(games: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([away, home]).drop_duplicates().reset_index(drop=True)
 
 
+# Re-exported for unit tests / notebook use.
 __all__ = [
     "GameRow",
     "SEASON_WINDOWS",

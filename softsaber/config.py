@@ -10,14 +10,24 @@ DATA_DIR = REPO_ROOT / "data"
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 
-# NCAA's GraphQL backend (sdataprod.ncaa.com) keys softball by sportCode/division
-# rather than a per-season div id, so we don't need a year-by-year ID table.
-SPORT_CODE_SOFTBALL = "WSB"
-DIVISION_CODES: dict[str, int] = {"D1": 1, "D2": 2, "D3": 3}
+# stats.ncaa.org uses a season_division_id keyed by (division, year). Values
+# through 2024 come from softballR; 2025/2026 need to be discovered by hitting
+# the scoreboard page for a known date and reading the redirect / page source.
+# Override via NCAA_DIVISION_IDS env if you confirm new values.
+DIVISION_IDS: dict[tuple[str, int], int] = {
+    ("D1", 2021): 17540,
+    ("D1", 2022): 17840,
+    ("D1", 2023): 18101,
+    ("D1", 2024): 18261,
+    ("D1", 2025): 18503,
+    ("D1", 2026): 18763,
+}
 
+# Default focus per the project plan.
 TARGET_SEASONS: tuple[int, ...] = (2024, 2025, 2026)
 TARGET_DIVISION: str = "D1"
 
+# stats.ncaa.org blocks unrecognized clients; set a browser-like UA.
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
@@ -26,6 +36,7 @@ USER_AGENT = (
 REQUEST_TIMEOUT_S = 30
 REQUEST_RETRY_MAX = 5
 REQUEST_RETRY_BASE_DELAY_S = 2.0
+# stats.ncaa.org is slow; keep us friendly.
 INTER_REQUEST_DELAY_S = 0.75
 
 
@@ -35,13 +46,13 @@ class Season:
     division: str = TARGET_DIVISION
 
     @property
-    def division_code(self) -> int:
+    def division_id(self) -> int:
         try:
-            return DIVISION_CODES[self.division]
+            return DIVISION_IDS[(self.division, self.year)]
         except KeyError as e:
             raise KeyError(
-                f"No NCAA division code mapped for {self.division}. "
-                f"Known: {sorted(DIVISION_CODES)}"
+                f"No stats.ncaa.org division_id mapped for {self.division} {self.year}. "
+                f"Add it to softsaber.config.DIVISION_IDS."
             ) from e
 
 
