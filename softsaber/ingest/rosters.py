@@ -68,7 +68,7 @@ def ingest_season_rosters(team_ids: pd.DataFrame, season: int) -> pd.DataFrame:
                 r["team_name"] = row["team_name"]
                 frames.append(r)
         except Exception as e:  # noqa: BLE001
-            log.warning("roster team %s failed: %s", row["softball_id"], e)
+            log.warning("roster team %s failed: %s", row["softball_id"], e, exc_info=log.isEnabledFor(logging.DEBUG))
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not df.empty:
         storage.write_partition("rosters", str(season), df)

@@ -85,11 +85,13 @@ def fetch_game_pbp(game_id: str) -> pd.DataFrame:
     if pbp_id is None:
         log.warning("game %s: no pbp link on box score", game_id)
         return pd.DataFrame()
+    log.debug("game %s: discovered pbp_id=%s", game_id, pbp_id)
 
     html = fetch(PBP_URL_FMT.format(pbp_id=pbp_id), namespace="pbp")
     tables = pd.read_html(io.StringIO(html))
+    log.debug("game %s: %d tables on pbp page", game_id, len(tables))
     if len(tables) < 6:
-        log.warning("game %s: pbp page returned %d tables", game_id, len(tables))
+        log.warning("game %s: pbp page returned %d tables (expected ≥6)", game_id, len(tables))
         return pd.DataFrame()
 
     # softballR drops tables[0:4] (game header / lineups) and then keeps every
@@ -185,11 +187,14 @@ def _split_score(cell: object) -> tuple[int | None, int | None]:
 def ingest_season_pbp(games: pd.DataFrame, season: int) -> pd.DataFrame:
     """Pull PBP for every finalized game in ``games`` and write a parquet partition."""
     frames = []
-    for gid in games["game_id"].astype(str):
+    game_ids = games["game_id"].astype(str).tolist()
+    total = len(game_ids)
+    for i, gid in enumerate(game_ids, 1):
+        log.debug("pbp game %s (%d/%d)", gid, i, total)
         try:
             frames.append(fetch_game_pbp(gid))
         except Exception as e:  # noqa: BLE001 — never let one game halt the season
-            log.warning("pbp game %s failed: %s", gid, e)
+            log.warning("pbp game %s failed: %s", gid, e, exc_info=log.isEnabledFor(logging.DEBUG))
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not df.empty:
         df["season"] = season
