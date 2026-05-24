@@ -39,7 +39,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from .. import storage
-from ..config import REQUEST_WORKERS
+from ..config import HENRYGD_WORKERS
 from . import ncaa_api
 
 log = logging.getLogger(__name__)
@@ -294,8 +294,8 @@ def ingest_pbp_for_games(
     ``"2024"`` for a full season, ``"2024-05-04"`` for a single day).
     """
     game_ids = games["game_id"].astype(str).tolist()
-    log.info("pbp: fetching %d games with %d workers", len(game_ids), REQUEST_WORKERS)
-    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+    log.info("pbp: fetching %d games with %d workers", len(game_ids), HENRYGD_WORKERS)
+    with ThreadPoolExecutor(max_workers=HENRYGD_WORKERS) as exe:
         results = list(exe.map(fetch_game_pbp, game_ids))
     frames = [df for df in results if not df.empty]
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

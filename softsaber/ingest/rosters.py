@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pandas as pd
 
 from .. import storage
-from ..config import REQUEST_WORKERS
+from ..config import HENRYGD_WORKERS, NCAA_STATS_WORKERS
 from . import ncaa_api, ncaa_stats
 
 log = logging.getLogger(__name__)
@@ -214,7 +214,7 @@ def _try_ncaa_rosters(teams: pd.DataFrame, year: int) -> pd.DataFrame:
         df["season"] = year
         return df
 
-    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+    with ThreadPoolExecutor(max_workers=NCAA_STATS_WORKERS) as exe:
         results = list(exe.map(_fetch, eligible.itertuples(index=False)))
 
     frames = [df for df in results if not df.empty]
@@ -244,7 +244,7 @@ def ingest_season_rosters(
     if combined.empty:
         log.info("rosters: NCAA fetch yielded nothing — falling back to henrygd boxscores")
         game_ids = games["game_id"].astype(str).tolist()
-        with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        with ThreadPoolExecutor(max_workers=HENRYGD_WORKERS) as exe:
             results = list(exe.map(_boxscore_to_player_rows, game_ids))
         frames = [df for df in results if not df.empty]
         if not frames:

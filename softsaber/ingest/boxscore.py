@@ -29,7 +29,7 @@ from typing import Any
 import pandas as pd
 
 from .. import storage
-from ..config import REQUEST_WORKERS
+from ..config import HENRYGD_WORKERS
 from . import ncaa_api
 
 log = logging.getLogger(__name__)
@@ -132,7 +132,7 @@ def ingest_boxscores_for_games(games: pd.DataFrame, partition: str | None = None
     ``"2024-05-04"``).  Returns the count of games successfully fetched.
     """
     game_ids = games["game_id"].astype(str).tolist()
-    log.info("boxscore: fetching %d games with %d workers", len(game_ids), REQUEST_WORKERS)
+    log.info("boxscore: fetching %d games with %d workers", len(game_ids), HENRYGD_WORKERS)
 
     def _fetch_and_parse(gid: str) -> pd.DataFrame:
         payload = fetch_game_boxscore(gid)
@@ -140,7 +140,7 @@ def ingest_boxscores_for_games(games: pd.DataFrame, partition: str | None = None
             return pd.DataFrame()
         return parse_boxscore(payload, gid)
 
-    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+    with ThreadPoolExecutor(max_workers=HENRYGD_WORKERS) as exe:
         results = list(exe.map(_fetch_and_parse, game_ids))
     frames = [df for df in results if not df.empty]
     fetched = sum(1 for df in results if not df.empty)

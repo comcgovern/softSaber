@@ -39,7 +39,7 @@ from typing import Any
 import pandas as pd
 from lxml import html as lxml_html
 
-from ..config import REQUEST_WORKERS
+from ..config import NCAA_STATS_WORKERS
 from ..http_cache import FetchError, fetch
 
 log = logging.getLogger(__name__)
@@ -295,7 +295,7 @@ def discover_team_season_ids(
     # Path 1: per-game pages (no extra config needed).
     if contest_ids:
         batch = [str(c) for c in contest_ids[:max_contests]]
-        with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        with ThreadPoolExecutor(max_workers=NCAA_STATS_WORKERS) as exe:
             for found in exe.map(_discover_via_contest, batch):
                 results.update(found)
 
