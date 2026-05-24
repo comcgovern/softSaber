@@ -73,7 +73,12 @@ def _parse_team_links(html: str) -> dict[str, str]:
     """Extract ``{team_name: stats_ncaa_team_id}`` from any HTML page with
     ``<a href="/teams/{id}">`` links.
 
-    Ignores entries whose link text is empty or purely numeric (nav artifacts).
+    Prefers the direct text node of the anchor (``a.text``) over
+    ``text_content()`` to avoid picking up child-element text such as
+    conference abbreviations rendered inside a ``<span>``.  Falls back to
+    ``text_content()`` when the direct text node is blank.
+
+    Ignores entries whose extracted text is empty or purely numeric.
     """
     try:
         tree = lxml_html.fromstring(html)
@@ -86,9 +91,15 @@ def _parse_team_links(html: str) -> dict[str, str]:
         m = _TEAM_LINK_RE.search(href)
         if not m:
             continue
-        name = a.text_content().strip()
+        # Prefer the direct text node; child elements (spans, etc.) often
+        # carry conference names or decorators that pollute text_content().
+        name = (a.text or "").strip() or a.text_content().strip()
         if name and not name.isdigit():
             result[name] = m.group(1)
+
+    if result:
+        sample = list(result.items())[:5]
+        log.debug("_parse_team_links: %d entries, sample=%s", len(result), sample)
     return result
 
 
@@ -128,7 +139,8 @@ def _discover_via_ranking(
     try:
         html = fetch(url, namespace=f"ncaa_stats/rankings/{year}")
         found = _parse_team_links(html)
-        log.info("ranking page year=%s: found %d team links", year, len(found))
+        sample = list(found.keys())[:10]
+        log.info("ranking page year=%s: found %d team links, sample=%s", year, len(found), sample)
         return found
     except FetchError as e:
         log.warning("ranking page year=%s: %s", year, e)

@@ -131,11 +131,14 @@ def discover_and_update_teams(
     )
     unmatched = teams[teams["stats_ncaa_team_id"].isna()]["team_name"].tolist()
     if unmatched:
+        sample_ncaa = list(id_map.keys())[:10]
         log.warning(
-            "year %s: %d teams without stats_ncaa_team_id — names: %s",
+            "year %s: %d teams without stats_ncaa_team_id — "
+            "unmatched henrygd names: %s | sample ncaa names: %s",
             year,
             len(unmatched),
             unmatched,
+            sample_ncaa,
         )
 
     storage.write_partition("teams", str(year), teams)
