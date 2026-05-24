@@ -94,6 +94,8 @@ def _parse_team_links(html: str) -> dict[str, str]:
         # Prefer the direct text node; child elements (spans, etc.) often
         # carry conference names or decorators that pollute text_content().
         name = (a.text or "").strip() or a.text_content().strip()
+        # stats.ncaa.org appends conference in parens: "Oklahoma (SEC)" → strip it.
+        name = re.sub(r"\s*\([^)]*\)\s*$", "", name).strip()
         if name and not name.isdigit():
             result[name] = m.group(1)
 
