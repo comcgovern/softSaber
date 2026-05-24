@@ -1,22 +1,23 @@
-"""Season roster ingest, bridging the teams table to stats.ncaa.org player IDs.
+"""Season roster ingest — maps stats.ncaa.org ncaa_player_id to player names.
 
 The pipeline has two steps:
 
-1. **ID discovery** — call :func:`discover_and_update_teams` with the game
-   ``contestId`` list from the games table.  This fetches per-game stats pages
-   on stats.ncaa.org and parses ``/teams/{year_specific_id}`` links.  The
-   resulting ``{team_name: stats_ncaa_team_id}`` map is joined to the teams
-   table and written back to disk.
+1. **Team ID discovery** — :func:`discover_and_update_teams` fetches per-game
+   stats pages on stats.ncaa.org and parses ``/teams/{year_specific_id}``
+   links, writing ``stats_ncaa_team_id`` back to the teams partition.
 
 2. **Player ID extraction** — stats.ncaa.org/teams/{id}/roster pages are
-   JavaScript-rendered; plain HTTP clients receive a 2 KB HTML shell with no
-   table data.  Instead, we re-use the already-cached contest box_score pages
-   and parse ``/player/{ncaa_player_id}`` links from them.  This captures every
-   player who appeared in any game in the dataset without any extra fetches.
+   JavaScript-rendered (2 KB empty shell).  Instead, the ``individual_stats``
+   page for each contest is fetched; these are server-rendered and embed
+   ``/player/{ncaa_player_id}`` links for every player in the game.
 
 Output parquet schema (``rosters/{season}``):
 
-    season, team_name, stats_ncaa_team_id, ncaa_player_id, player_name
+    season, ncaa_player_id, player_name
+
+Team context is intentionally omitted: the ``individual_stats`` pages do not
+carry ``/teams/`` links so team association must be resolved downstream via
+the games and game_players partitions.
 """
 
 from __future__ import annotations
@@ -166,20 +167,13 @@ def ingest_season_rosters(
         log.warning("teams table has no stats_ncaa_team_id — run discover first")
         return pd.DataFrame()
 
-    tid_to_name: dict[str, str] = (
-        teams[teams["stats_ncaa_team_id"].notna()]
-        .set_index("stats_ncaa_team_id")["team_name"]
-        .to_dict()
-    )
-
     contest_ids = games["game_id"].astype(str).tolist()
     players = ncaa_stats.build_ncaa_player_map(contest_ids, year)
 
     if players.empty:
-        log.warning("rosters year=%s: no players found from contest pages", year)
+        log.warning("rosters year=%s: no players found from individual_stats pages", year)
         return pd.DataFrame()
 
-    players["team_name"] = players["stats_ncaa_team_id"].map(tid_to_name)
     players["season"] = year
 
     storage.write_partition("rosters", str(year), players)

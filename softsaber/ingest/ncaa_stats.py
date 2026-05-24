@@ -48,9 +48,11 @@ log = logging.getLogger(__name__)
 
 ROSTER_URL = "https://stats.ncaa.org/teams/{team_season_id}/roster"
 
-# Game boxscore page on stats.ncaa.org: carries /teams/{id} links for both teams.
-# "individual_stats" does NOT have team links — it only has /player/{id} hrefs.
+# Game boxscore page: server-rendered HTML with /teams/{id} links for both teams.
 CONTEST_STATS_URL = "https://stats.ncaa.org/contests/{contest_id}/box_score"
+
+# Individual stats page: server-rendered HTML with /player/{id} links (no team links).
+INDIVIDUAL_STATS_URL = "https://stats.ncaa.org/contests/{contest_id}/individual_stats"
 
 # National ranking page: one per sport-division-year, lists all teams.
 # ranking_period is a year-specific ID (e.g. 113 for WSB 2026 end-of-season).
@@ -105,16 +107,12 @@ def _parse_team_links(html: str) -> dict[str, str]:
     return result
 
 
-def _parse_players_from_boxscore(html: str) -> list[dict[str, str]]:
-    """Extract player records from a contest box_score page.
+def _parse_player_links(html: str) -> list[dict[str, str]]:
+    """Extract ``{ncaa_player_id, player_name}`` pairs from ``/player/`` links.
 
-    Walks all ``/teams/`` and ``/player/`` links in document order.  Each
-    ``/teams/`` link updates the current team context; subsequent ``/player/``
-    links are associated with that team.  This matches the natural layout of
-    an NCAA box score (home section then away section, or vice-versa).
-
-    Returns a list of ``{ncaa_player_id, player_name, stats_ncaa_team_id}``
-    dicts, deduplicated by ``(ncaa_player_id, stats_ncaa_team_id)``.
+    Used on ``individual_stats`` pages, which embed one link per player with
+    the player's name as link text.  No team context is available on these
+    pages; association happens downstream via the games table.
     """
     try:
         tree = lxml_html.fromstring(html)
@@ -122,52 +120,41 @@ def _parse_players_from_boxscore(html: str) -> list[dict[str, str]]:
         return []
 
     players: list[dict[str, str]] = []
-    current_team_id: str | None = None
     seen: set[str] = set()
 
-    selector = '//a[contains(@href, "/teams/") or contains(@href, "/player/")]'
-    for a in tree.xpath(selector):
+    for a in tree.xpath('//a[contains(@href, "/player/")]'):
         href = str(a.get("href") or "")
-
-        tm = _TEAM_LINK_RE.search(href)
-        if tm:
-            current_team_id = tm.group(1)
+        m = _PLAYER_LINK_RE.search(href)
+        if not m:
             continue
-
-        pm = _PLAYER_LINK_RE.search(href)
-        if pm and current_team_id:
-            pid = pm.group(1)
-            name = (a.text or "").strip() or a.text_content().strip()
-            key = f"{pid}:{current_team_id}"
-            if name and key not in seen:
-                seen.add(key)
-                players.append(
-                    {
-                        "ncaa_player_id": pid,
-                        "player_name": name,
-                        "stats_ncaa_team_id": current_team_id,
-                    }
-                )
+        pid = m.group(1)
+        if pid in seen:
+            continue
+        name = (a.text or "").strip() or a.text_content().strip()
+        if name and not name.isdigit():
+            seen.add(pid)
+            players.append({"ncaa_player_id": pid, "player_name": name})
 
     return players
 
 
 def fetch_players_from_contest(contest_id: str, year: int) -> list[dict[str, str]]:
-    """Return player records from one contest's box_score page.
+    """Return ``{ncaa_player_id, player_name}`` records from one game's
+    ``individual_stats`` page.
 
-    Re-uses the cached HTML written during team-ID discovery so no extra
-    network requests are made for contests already processed.
+    The ``individual_stats`` page is server-rendered and has ``/player/{id}``
+    links; the ``box_score`` page has team links but no player links.
     """
-    url = CONTEST_STATS_URL.format(contest_id=contest_id)
+    url = INDIVIDUAL_STATS_URL.format(contest_id=contest_id)
     try:
-        html = fetch(url, namespace="ncaa_stats/contests")
+        html = fetch(url, namespace=f"ncaa_stats/individual_stats/{year}")
     except FetchError as e:
-        log.debug("contest %s: player parse skipped (%s)", contest_id, e)
+        log.debug("contest %s: individual_stats skipped (%s)", contest_id, e)
         return []
     except Exception as e:  # noqa: BLE001
-        log.warning("contest %s: player parse error: %s", contest_id, e)
+        log.warning("contest %s: individual_stats error: %s", contest_id, e)
         return []
-    return _parse_players_from_boxscore(html)
+    return _parse_player_links(html)
 
 
 def build_ncaa_player_map(
@@ -176,17 +163,18 @@ def build_ncaa_player_map(
     *,
     max_contests: int | None = None,
 ) -> pd.DataFrame:
-    """Build a ``{ncaa_player_id, player_name, stats_ncaa_team_id}`` table.
+    """Build an ``{ncaa_player_id, player_name}`` table from game individual-stats pages.
 
-    Extracts player IDs from contest box_score pages, which are already cached
-    from the team-discovery step.  Returns every unique player-team pair seen
-    across all contests, deduped by ``(ncaa_player_id, stats_ncaa_team_id)``.
+    Fetches ``INDIVIDUAL_STATS_URL`` for each contest (these are separate from
+    the ``box_score`` pages cached for team discovery) and collects every
+    ``/player/{id}`` link found.  Returns a DataFrame deduped by
+    ``ncaa_player_id``, keeping the first name seen for each ID.
     """
     batch = [str(c) for c in contest_ids]
     if max_contests is not None:
         batch = batch[:max_contests]
 
-    log.info("player map: scanning %d contest box_score pages", len(batch))
+    log.info("player map: scanning %d individual_stats pages", len(batch))
 
     def _fetch(cid: str) -> list[dict[str, str]]:
         return fetch_players_from_contest(cid, year)
@@ -196,15 +184,13 @@ def build_ncaa_player_map(
 
     all_players: list[dict[str, str]] = [rec for recs in results for rec in recs]
     if not all_players:
-        log.warning("player map: no players found from %d contest pages", len(batch))
+        log.warning("player map: no players found from %d individual_stats pages", len(batch))
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_players).drop_duplicates(
-        subset=["ncaa_player_id", "stats_ncaa_team_id"]
-    )
+    df = pd.DataFrame(all_players).drop_duplicates(subset=["ncaa_player_id"])
     sample = df["player_name"].head(5).tolist()
     log.info(
-        "player map: %d unique player-team records from %d contests, sample names=%s",
+        "player map: %d unique players from %d contests, sample names=%s",
         len(df),
         len(batch),
         sample,
@@ -306,6 +292,7 @@ def discover_team_season_ids(
 
 __all__ = [
     "CONTEST_STATS_URL",
+    "INDIVIDUAL_STATS_URL",
     "NATIONAL_RANKING_URL",
     "ROSTER_URL",
     "build_ncaa_player_map",
