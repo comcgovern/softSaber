@@ -24,7 +24,7 @@ import pandas as pd
 
 from .. import storage
 from ..config import HENRYGD_WORKERS, NCAA_STATS_WORKERS
-from . import ncaa_api, ncaa_stats
+from . import ncaa_api, ncaa_stats, sdataprod
 
 log = logging.getLogger(__name__)
 
@@ -132,6 +132,84 @@ def discover_and_update_teams(
 # Roster extraction from boxscore data
 # ---------------------------------------------------------------------------
 
+def _is_degraded_first_name(first: str) -> bool:
+    """A boxscore firstName is degraded if it's empty or just an initial.
+
+    ~12% of softball entries arrive this way at the upstream source:
+    ~8.8% first-initial (e.g. ``"A."``, ``"A"``) and ~3.1% empty.
+    """
+    if not first:
+        return True
+    stripped = first.replace(".", "").strip()
+    return len(stripped) <= 1
+
+
+def _gamecenter_name_index(payload: dict) -> dict[tuple[str, str, str], str]:
+    """Walk a GameCenter payload and build a name-upgrade lookup.
+
+    Returns a mapping ``(team_id, last_name_lower, jersey_str) → full_first_name``.
+    Only entries with a usable (non-degraded) first name are included, so
+    callers can blindly do ``index.get(key)`` to test for an upgrade.
+
+    The GameCenter response shape isn't strictly contracted, so we
+    recursively walk every dict, looking for ones that smell like a
+    player record (carry both ``firstName`` and ``lastName``).  A nearby
+    ``teamId`` and ``jerseyNumber``/``number`` are picked up from the
+    same dict.
+    """
+    index: dict[tuple[str, str, str], str] = {}
+
+    def _walk(node: object) -> None:
+        if isinstance(node, dict):
+            first = str(node.get("firstName") or "").strip()
+            last = str(node.get("lastName") or "").strip()
+            if first and last and not _is_degraded_first_name(first):
+                tid = str(node.get("teamId") or node.get("team_id") or "").strip()
+                jersey_raw = (
+                    node.get("jerseyNumber")
+                    if node.get("jerseyNumber") is not None
+                    else node.get("number")
+                )
+                jersey = "" if jersey_raw is None else str(jersey_raw).strip()
+                index[(tid, last.lower(), jersey)] = first
+                # Also index without team_id and without jersey so the
+                # lookup can fall back when boxscore lacks one of those.
+                index.setdefault(("", last.lower(), jersey), first)
+                index.setdefault((tid, last.lower(), ""), first)
+                index.setdefault(("", last.lower(), ""), first)
+            for v in node.values():
+                _walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                _walk(v)
+
+    _walk(payload)
+    return index
+
+
+def _upgrade_first_name(
+    index: dict[tuple[str, str, str], str],
+    team_id: str,
+    last: str,
+    jersey: object,
+) -> str | None:
+    """Look up a richer first name from a GameCenter index, or None."""
+    if not index or not last:
+        return None
+    jstr = "" if jersey is None else str(jersey).strip()
+    last_l = last.lower()
+    for key in (
+        (team_id, last_l, jstr),
+        (team_id, last_l, ""),
+        ("", last_l, jstr),
+        ("", last_l, ""),
+    ):
+        hit = index.get(key)
+        if hit:
+            return hit
+    return None
+
+
 def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
     """Fetch one game's boxscore and return a per-player DataFrame.
 
@@ -162,6 +240,8 @@ def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
             "is_home": bool(t.get("isHome")),
         }
 
+    gc_index: dict[tuple[str, str, str], str] | None = None
+
     for team_box in payload.get("teamBoxscore") or []:
         if not isinstance(team_box, dict):
             continue
@@ -174,6 +254,19 @@ def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
             last = str(p.get("lastName") or "").strip()
             if not first and not last:
                 continue
+            jersey = p.get("number")
+
+            # ~12% of softball boxscore entries are degraded ("A.", "").
+            # When that happens, lazily fetch the richer GameCenter payload
+            # for this contest and use it to upgrade the first name.
+            if last and _is_degraded_first_name(first):
+                if gc_index is None:
+                    gc_payload = sdataprod.fetch_gamecenter(game_id)
+                    gc_index = _gamecenter_name_index(gc_payload) if gc_payload else {}
+                upgrade = _upgrade_first_name(gc_index, tid, last, jersey)
+                if upgrade:
+                    first = upgrade
+
             rows.append(
                 {
                     "team_id": tid,
@@ -182,7 +275,7 @@ def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
                     "first_name": first,
                     "last_name": last,
                     "player_name": f"{first} {last}".strip(),
-                    "jersey": p.get("number"),
+                    "jersey": jersey,
                     "position": str(p.get("position") or "").strip(),
                 }
             )

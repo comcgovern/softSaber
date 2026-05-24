@@ -142,6 +142,53 @@ def test_resolve_batter_names_empty_game_players() -> None:
     assert resolved["batter"].iloc[0] == "KNIGHT, S"
 
 
+def test_resolve_batter_names_degraded_boxscore_upgraded_by_rosters() -> None:
+    """Degraded boxscore name ("A. Lightner") resolves to full GameCenter name.
+
+    Simulates the production scenario:
+    - game_players has the degraded first name ``"A."`` from the boxscore.
+    - rosters has the GameCenter-upgraded ``"Andrea"``.
+    resolve_batter_names should pick the richer rosters row.
+    """
+    pbp = pd.DataFrame([
+        _make_pbp_row(events="LIGHTNER, A singled to right.", batting_team_id="11"),
+    ])
+    game_players = pd.DataFrame([
+        {"game_id": "g1", "team_id": "11",
+         "first_name": "A.", "last_name": "Lightner",
+         "player_name": "A. Lightner", "starter": True},
+    ])
+    rosters = pd.DataFrame([
+        {"team_id": "11",
+         "first_name": "Andrea", "last_name": "Lightner",
+         "player_name": "Andrea Lightner", "jersey": 7},
+    ])
+
+    pa = build_pa_table(pbp)
+    resolved = resolve_batter_names(pa, game_players, rosters=rosters)
+
+    assert resolved["batter"].iloc[0] == "Andrea Lightner"
+    assert resolved["batter_resolved"].iloc[0]
+
+
+def test_resolve_batter_names_falls_back_to_game_players_when_rosters_miss() -> None:
+    pbp = pd.DataFrame([
+        _make_pbp_row(events="KNIGHT, S singled to right.", batting_team_id="11"),
+    ])
+    game_players = pd.DataFrame([
+        {"game_id": "g1", "team_id": "11", "first_name": "Shelby", "last_name": "Knight",
+         "player_name": "Shelby Knight", "starter": True},
+    ])
+    # Rosters has a different team — should not match, fallback wins.
+    rosters = pd.DataFrame([
+        {"team_id": "99", "first_name": "Other", "last_name": "Knight",
+         "player_name": "Other Knight", "jersey": 1},
+    ])
+    pa = build_pa_table(pbp)
+    resolved = resolve_batter_names(pa, game_players, rosters=rosters)
+    assert resolved["batter"].iloc[0] == "Shelby Knight"
+
+
 def test_resolve_batter_names_team_scoped() -> None:
     """Players from game_players are filtered to batting_team_id first."""
     pbp = pd.DataFrame([
