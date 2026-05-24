@@ -244,7 +244,7 @@ def ingest_rosters(
         raise SystemExit(f"no teams partition for {year} — run `ingest teams` first")
 
     teams = rosters_mod.discover_and_update_teams(teams, games, year)
-    df = rosters_mod.ingest_season_rosters(teams, year)
+    df = rosters_mod.ingest_season_rosters(teams, games, year)
     typer.echo(f"roster rows written: {len(df)}")
 
 

@@ -1,4 +1,4 @@
-"""Scraper for stats.ncaa.org team and roster pages.
+"""Scraper for stats.ncaa.org team and player pages.
 
 stats.ncaa.org uses a year-specific numeric team ID that differs from both the
 henrygd API ``teamId`` and the stable ``team_id`` from ``/game_upload/team_codes``.
@@ -20,17 +20,17 @@ Discovery paths (both parse ``/teams/{numeric_id}`` links from HTML):
    Requires knowing the sport-specific ``stat_seq`` value; see ``config.py``.
    URL: ``NATIONAL_RANKING_URL``.
 
-Roster page (once the team-season ID is known):
+Player ID extraction (no separate roster fetch needed):
 
-    https://stats.ncaa.org/teams/{team_season_id}/roster
-
-Player rows on the roster page carry links of the form ``/player/{ncaa_player_id}/...``,
-giving us the global, stable NCAA player ID we can use to join across seasons.
+    stats.ncaa.org/teams/{id}/roster pages are JavaScript-rendered and return
+    an empty HTML shell to non-browser clients.  Instead, player IDs are
+    extracted from the contest box_score pages already fetched for team
+    discovery — each box score page embeds ``/player/{ncaa_player_id}`` links
+    for every player who appeared in that game.
 """
 
 from __future__ import annotations
 
-import io
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -103,6 +103,113 @@ def _parse_team_links(html: str) -> dict[str, str]:
         sample = list(result.items())[:5]
         log.debug("_parse_team_links: %d entries, sample=%s", len(result), sample)
     return result
+
+
+def _parse_players_from_boxscore(html: str) -> list[dict[str, str]]:
+    """Extract player records from a contest box_score page.
+
+    Walks all ``/teams/`` and ``/player/`` links in document order.  Each
+    ``/teams/`` link updates the current team context; subsequent ``/player/``
+    links are associated with that team.  This matches the natural layout of
+    an NCAA box score (home section then away section, or vice-versa).
+
+    Returns a list of ``{ncaa_player_id, player_name, stats_ncaa_team_id}``
+    dicts, deduplicated by ``(ncaa_player_id, stats_ncaa_team_id)``.
+    """
+    try:
+        tree = lxml_html.fromstring(html)
+    except Exception:
+        return []
+
+    players: list[dict[str, str]] = []
+    current_team_id: str | None = None
+    seen: set[str] = set()
+
+    selector = '//a[contains(@href, "/teams/") or contains(@href, "/player/")]'
+    for a in tree.xpath(selector):
+        href = str(a.get("href") or "")
+
+        tm = _TEAM_LINK_RE.search(href)
+        if tm:
+            current_team_id = tm.group(1)
+            continue
+
+        pm = _PLAYER_LINK_RE.search(href)
+        if pm and current_team_id:
+            pid = pm.group(1)
+            name = (a.text or "").strip() or a.text_content().strip()
+            key = f"{pid}:{current_team_id}"
+            if name and key not in seen:
+                seen.add(key)
+                players.append(
+                    {
+                        "ncaa_player_id": pid,
+                        "player_name": name,
+                        "stats_ncaa_team_id": current_team_id,
+                    }
+                )
+
+    return players
+
+
+def fetch_players_from_contest(contest_id: str, year: int) -> list[dict[str, str]]:
+    """Return player records from one contest's box_score page.
+
+    Re-uses the cached HTML written during team-ID discovery so no extra
+    network requests are made for contests already processed.
+    """
+    url = CONTEST_STATS_URL.format(contest_id=contest_id)
+    try:
+        html = fetch(url, namespace="ncaa_stats/contests")
+    except FetchError as e:
+        log.debug("contest %s: player parse skipped (%s)", contest_id, e)
+        return []
+    except Exception as e:  # noqa: BLE001
+        log.warning("contest %s: player parse error: %s", contest_id, e)
+        return []
+    return _parse_players_from_boxscore(html)
+
+
+def build_ncaa_player_map(
+    contest_ids: list[str],
+    year: int,
+    *,
+    max_contests: int | None = None,
+) -> pd.DataFrame:
+    """Build a ``{ncaa_player_id, player_name, stats_ncaa_team_id}`` table.
+
+    Extracts player IDs from contest box_score pages, which are already cached
+    from the team-discovery step.  Returns every unique player-team pair seen
+    across all contests, deduped by ``(ncaa_player_id, stats_ncaa_team_id)``.
+    """
+    batch = [str(c) for c in contest_ids]
+    if max_contests is not None:
+        batch = batch[:max_contests]
+
+    log.info("player map: scanning %d contest box_score pages", len(batch))
+
+    def _fetch(cid: str) -> list[dict[str, str]]:
+        return fetch_players_from_contest(cid, year)
+
+    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        results = list(exe.map(_fetch, batch))
+
+    all_players: list[dict[str, str]] = [rec for recs in results for rec in recs]
+    if not all_players:
+        log.warning("player map: no players found from %d contest pages", len(batch))
+        return pd.DataFrame()
+
+    df = pd.DataFrame(all_players).drop_duplicates(
+        subset=["ncaa_player_id", "stats_ncaa_team_id"]
+    )
+    sample = df["player_name"].head(5).tolist()
+    log.info(
+        "player map: %d unique player-team records from %d contests, sample names=%s",
+        len(df),
+        len(batch),
+        sample,
+    )
+    return df.reset_index(drop=True)
 
 
 # --- Discovery ---------------------------------------------------------------
@@ -197,102 +304,11 @@ def discover_team_season_ids(
     return results
 
 
-# --- Roster scraping ---------------------------------------------------------
-
-def _parse_roster_html(html: str, team_season_id: str) -> pd.DataFrame:
-    """Parse the roster HTML into a per-player DataFrame.
-
-    NCAA roster pages vary year-to-year in column ordering, so we take two
-    passes:
-    1. Use pandas ``read_html`` to get the tabular data (handles varied column
-       headers gracefully).
-    2. Re-scan with lxml to pull ``ncaa_player_id`` from ``/player/{id}``
-       links, which ``read_html`` discards.
-    """
-    try:
-        tables = pd.read_html(io.StringIO(html))
-    except Exception:
-        tables = []
-
-    if not tables:
-        log.debug("team %s: no tables found on roster page", team_season_id)
-        return pd.DataFrame()
-
-    # Take the largest table — the roster is usually the biggest one.
-    df = max(tables, key=len).copy()
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    rename = {
-        "#": "jersey",
-        "no.": "jersey",
-        "no": "jersey",
-        "name": "player_name",
-        "player": "player_name",
-        "pos": "position",
-        "position": "position",
-        "yr": "class_year",
-        "cl": "class_year",
-        "class": "class_year",
-        "ht": "height",
-        "hometown": "hometown",
-        "high_school": "high_school",
-    }
-    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-    df["team_season_id"] = team_season_id
-
-    # Second pass: pull ncaa_player_id from href="/player/{id}" links.
-    player_ids: list[str | None] = []
-    try:
-        tree = lxml_html.fromstring(html)
-        for a in tree.xpath('//a[contains(@href, "/player/")]'):
-            m = _PLAYER_LINK_RE.search(str(a.get("href") or ""))
-            if m:
-                player_ids.append(m.group(1))
-    except Exception:
-        pass
-
-    # Align player ID list to DataFrame rows (best-effort; drop if mismatched).
-    if len(player_ids) == len(df):
-        df["ncaa_player_id"] = player_ids
-    elif player_ids:
-        log.debug(
-            "team %s: %d player links vs %d table rows — skipping ID join",
-            team_season_id,
-            len(player_ids),
-            len(df),
-        )
-
-    return df.reset_index(drop=True)
-
-
-def fetch_team_roster(
-    team_season_id: str,
-    year: int,
-    *,
-    force: bool = False,
-) -> pd.DataFrame:
-    """Fetch and parse the roster for one team-season.
-
-    Returns an empty DataFrame if the page is unavailable or unparseable.
-    """
-    url = ROSTER_URL.format(team_season_id=team_season_id)
-    try:
-        html = fetch(url, namespace=f"ncaa_stats/rosters/{year}", force=force)
-    except FetchError as e:
-        log.warning("roster team_season_id=%s: %s", team_season_id, e)
-        return pd.DataFrame()
-    except Exception as e:  # noqa: BLE001
-        log.warning("roster team_season_id=%s: unexpected error: %s", team_season_id, e)
-        return pd.DataFrame()
-
-    df = _parse_roster_html(html, team_season_id)
-    log.info("roster team_season_id=%s: %d players", team_season_id, len(df))
-    return df
-
-
 __all__ = [
     "CONTEST_STATS_URL",
     "NATIONAL_RANKING_URL",
     "ROSTER_URL",
+    "build_ncaa_player_map",
     "discover_team_season_ids",
-    "fetch_team_roster",
+    "fetch_players_from_contest",
 ]

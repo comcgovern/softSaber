@@ -1,34 +1,33 @@
-"""Season roster ingest, bridging the teams table to stats.ncaa.org roster pages.
+"""Season roster ingest, bridging the teams table to stats.ncaa.org player IDs.
 
 The pipeline has two steps:
 
-1. **ID discovery** — call :func:`ncaa_stats.discover_team_season_ids` with the
-   game ``contestId`` list from the games table.  This fetches per-game stats
-   pages on stats.ncaa.org and parses ``/teams/{year_specific_id}`` links.
-   The resulting ``{team_name: stats_ncaa_team_id}`` map is joined to the teams
+1. **ID discovery** — call :func:`discover_and_update_teams` with the game
+   ``contestId`` list from the games table.  This fetches per-game stats pages
+   on stats.ncaa.org and parses ``/teams/{year_specific_id}`` links.  The
+   resulting ``{team_name: stats_ncaa_team_id}`` map is joined to the teams
    table and written back to disk.
 
-2. **Roster fetch** — for each team with a known ``stats_ncaa_team_id``, fetch
-   ``stats.ncaa.org/teams/{id}/roster`` and parse player rows.  Each player row
-   carries a ``ncaa_player_id`` from the ``/player/{id}`` link, giving us a
-   global, stable player identifier we can join across seasons and back to PBP.
+2. **Player ID extraction** — stats.ncaa.org/teams/{id}/roster pages are
+   JavaScript-rendered; plain HTTP clients receive a 2 KB HTML shell with no
+   table data.  Instead, we re-use the already-cached contest box_score pages
+   and parse ``/player/{ncaa_player_id}`` links from them.  This captures every
+   player who appeared in any game in the dataset without any extra fetches.
 
 Output parquet schema (``rosters/{season}``):
 
-    season, team_name, stats_ncaa_team_id,
-    ncaa_player_id, player_name, jersey, position, class_year
+    season, team_name, stats_ncaa_team_id, ncaa_player_id, player_name
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
 from .. import storage
-from ..config import REQUEST_WORKERS, WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
+from ..config import WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
 from . import ncaa_stats
 
 log = logging.getLogger(__name__)
@@ -147,9 +146,16 @@ def discover_and_update_teams(
 
 def ingest_season_rosters(
     teams: pd.DataFrame,
+    games: pd.DataFrame,
     year: int,
 ) -> pd.DataFrame:
-    """Fetch rosters for all teams that have a known ``stats_ncaa_team_id``.
+    """Extract player ncaa_player_ids from contest box_score pages.
+
+    stats.ncaa.org roster pages are JavaScript-rendered and return empty HTML
+    to plain HTTP clients.  This function instead re-uses the contest box_score
+    pages already cached during :func:`discover_and_update_teams` to pull
+    ``/player/{id}`` links, capturing every player who appeared in any game in
+    ``games``.
 
     ``teams`` must have ``team_name`` and ``stats_ncaa_team_id`` columns
     (populated by :func:`discover_and_update_teams`).
@@ -160,39 +166,25 @@ def ingest_season_rosters(
         log.warning("teams table has no stats_ncaa_team_id — run discover first")
         return pd.DataFrame()
 
-    eligible = teams[teams["stats_ncaa_team_id"].notna()].copy()
-    if eligible.empty:
-        log.warning("no teams with stats_ncaa_team_id for year %s", year)
+    tid_to_name: dict[str, str] = (
+        teams[teams["stats_ncaa_team_id"].notna()]
+        .set_index("stats_ncaa_team_id")["team_name"]
+        .to_dict()
+    )
+
+    contest_ids = games["game_id"].astype(str).tolist()
+    players = ncaa_stats.build_ncaa_player_map(contest_ids, year)
+
+    if players.empty:
+        log.warning("rosters year=%s: no players found from contest pages", year)
         return pd.DataFrame()
 
-    team_records = list(eligible.itertuples(index=False))
-    log.info("rosters: fetching %d teams with %d workers", len(team_records), REQUEST_WORKERS)
+    players["team_name"] = players["stats_ncaa_team_id"].map(tid_to_name)
+    players["season"] = year
 
-    def _fetch_roster(row) -> pd.DataFrame:  # type: ignore[type-arg]
-        tid = str(row.stats_ncaa_team_id)
-        df = ncaa_stats.fetch_team_roster(tid, year)
-        if df.empty:
-            return df
-        df["team_name"] = row.team_name
-        df["stats_ncaa_team_id"] = tid
-        df["season"] = year
-        return df
-
-    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
-        results = list(exe.map(_fetch_roster, team_records))
-    frames = [df for df in results if not df.empty]
-
-    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-
-    if not combined.empty:
-        # Normalise columns to the canonical schema — extras are kept as-is.
-        for col in ("ncaa_player_id", "player_name", "jersey", "position", "class_year"):
-            if col not in combined.columns:
-                combined[col] = None
-        storage.write_partition("rosters", str(year), combined)
-        log.info("rosters year=%s: wrote %d player rows", year, len(combined))
-
-    return combined
+    storage.write_partition("rosters", str(year), players)
+    log.info("rosters year=%s: wrote %d player rows", year, len(players))
+    return players
 
 
 __all__ = [
