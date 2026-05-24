@@ -7,17 +7,14 @@ The pipeline has two steps:
    links, writing ``stats_ncaa_team_id`` back to the teams partition.
 
 2. **Player ID extraction** — stats.ncaa.org/teams/{id}/roster pages are
-   JavaScript-rendered (2 KB empty shell).  Instead, the ``individual_stats``
-   page for each contest is fetched; these are server-rendered and embed
-   ``/player/{ncaa_player_id}`` links for every player in the game.
+   JavaScript-rendered (2 KB empty shell).  Instead, the national individual
+   player ranking page (``stat_seq=271``, batting average) is fetched; it is
+   server-rendered and has one ``/player/{id}`` + one ``/teams/{id}`` link per
+   row, giving us ncaa_player_id, player name, and team in a single request.
 
 Output parquet schema (``rosters/{season}``):
 
-    season, ncaa_player_id, player_name
-
-Team context is intentionally omitted: the ``individual_stats`` pages do not
-carry ``/teams/`` links so team association must be resolved downstream via
-the games and game_players partitions.
+    season, ncaa_player_id, player_name, stats_ncaa_team_id, team_name
 """
 
 from __future__ import annotations
@@ -150,16 +147,17 @@ def ingest_season_rosters(
     games: pd.DataFrame,
     year: int,
 ) -> pd.DataFrame:
-    """Extract player ncaa_player_ids from contest box_score pages.
+    """Build the player roster from the national individual-player ranking page.
 
-    stats.ncaa.org roster pages are JavaScript-rendered and return empty HTML
-    to plain HTTP clients.  This function instead re-uses the contest box_score
-    pages already cached during :func:`discover_and_update_teams` to pull
-    ``/player/{id}`` links, capturing every player who appeared in any game in
-    ``games``.
+    stats.ncaa.org/teams/{id}/roster pages are JavaScript-rendered (2 KB shell).
+    Instead, we fetch the ``stat_seq=271`` (individual batting average) ranking
+    page, which is server-rendered and carries one ``/player/{id}`` + one
+    ``/teams/{id}`` link per row, giving us ncaa_player_id, player name, and
+    team association in a single request.
 
     ``teams`` must have ``team_name`` and ``stats_ncaa_team_id`` columns
-    (populated by :func:`discover_and_update_teams`).
+    (populated by :func:`discover_and_update_teams`).  ``games`` is accepted
+    for call-site compatibility but is not used by this implementation.
 
     Writes ``rosters/{year}.parquet`` and returns the combined DataFrame.
     """
@@ -167,13 +165,20 @@ def ingest_season_rosters(
         log.warning("teams table has no stats_ncaa_team_id — run discover first")
         return pd.DataFrame()
 
-    contest_ids = games["game_id"].astype(str).tolist()
-    players = ncaa_stats.build_ncaa_player_map(contest_ids, year)
+    ranking_period = WSB_D1_RANKING_PERIOD.get(year)
+    players = ncaa_stats.build_ncaa_player_map(year, ranking_period=ranking_period)
 
     if players.empty:
-        log.warning("rosters year=%s: no players found from individual_stats pages", year)
+        log.warning("rosters year=%s: no players found from player ranking page", year)
         return pd.DataFrame()
 
+    # Join team name from the teams table via stats_ncaa_team_id.
+    tid_to_name: dict[str, str] = (
+        teams[teams["stats_ncaa_team_id"].notna()]
+        .set_index("stats_ncaa_team_id")["team_name"]
+        .to_dict()
+    )
+    players["team_name"] = players["stats_ncaa_team_id"].map(tid_to_name)
     players["season"] = year
 
     storage.write_partition("rosters", str(year), players)

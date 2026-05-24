@@ -107,12 +107,17 @@ def _parse_team_links(html: str) -> dict[str, str]:
     return result
 
 
-def _parse_player_links(html: str) -> list[dict[str, str]]:
-    """Extract ``{ncaa_player_id, player_name}`` pairs from ``/player/`` links.
+def _parse_ranking_page_players(html: str) -> list[dict[str, str]]:
+    """Extract player records from an individual-player national ranking page.
 
-    Used on ``individual_stats`` pages, which embed one link per player with
-    the player's name as link text.  No team context is available on these
-    pages; association happens downstream via the games table.
+    Each table row on stat_seq=271 (individual batting average) has one
+    ``/player/{id}`` link (the player) and one ``/teams/{id}`` link (their
+    team).  We scan per-row so the two links are reliably paired, giving us
+    ``ncaa_player_id``, ``player_name``, and ``stats_ncaa_team_id`` in one
+    pass.
+
+    This page is server-rendered (same infrastructure as the team-batting
+    ranking page that successfully returns 300+ team links).
     """
     try:
         tree = lxml_html.fromstring(html)
@@ -122,79 +127,98 @@ def _parse_player_links(html: str) -> list[dict[str, str]]:
     players: list[dict[str, str]] = []
     seen: set[str] = set()
 
-    for a in tree.xpath('//a[contains(@href, "/player/")]'):
-        href = str(a.get("href") or "")
-        m = _PLAYER_LINK_RE.search(href)
-        if not m:
-            continue
-        pid = m.group(1)
-        if pid in seen:
-            continue
-        name = (a.text or "").strip() or a.text_content().strip()
-        if name and not name.isdigit():
-            seen.add(pid)
-            players.append({"ncaa_player_id": pid, "player_name": name})
+    for row in tree.xpath("//tr"):
+        player_id = player_name = team_id = None
+
+        for a in row.xpath('.//a'):
+            href = str(a.get("href") or "")
+
+            pm = _PLAYER_LINK_RE.search(href)
+            if pm and player_id is None:
+                name = (a.text or "").strip() or a.text_content().strip()
+                if name and not name.isdigit():
+                    player_id = pm.group(1)
+                    player_name = name
+
+            tm = _TEAM_LINK_RE.search(href)
+            if tm and team_id is None:
+                team_id = tm.group(1)
+
+        if player_id and player_name and player_id not in seen:
+            seen.add(player_id)
+            players.append(
+                {
+                    "ncaa_player_id": player_id,
+                    "player_name": player_name,
+                    "stats_ncaa_team_id": team_id or "",
+                }
+            )
 
     return players
 
 
-def fetch_players_from_contest(contest_id: str, year: int) -> list[dict[str, str]]:
-    """Return ``{ncaa_player_id, player_name}`` records from one game's
-    ``individual_stats`` page.
+def _discover_players_via_ranking(
+    year: int,
+    division_id: int,
+    stat_seq: int,
+    ranking_period: int,
+) -> list[dict[str, str]]:
+    """Fetch the individual-player national ranking page and extract player records.
 
-    The ``individual_stats`` page is server-rendered and has ``/player/{id}``
-    links; the ``box_score`` page has team links but no player links.
+    Uses ``stat_seq=271`` (individual batting average) by default, which lists
+    every qualifying batter in the division with both a player link and a team
+    link on each row.  The page is server-rendered, the same infrastructure as
+    the team-batting ranking page (stat_seq=281).
     """
-    url = INDIVIDUAL_STATS_URL.format(contest_id=contest_id)
+    url = NATIONAL_RANKING_URL.format(
+        year=year,
+        division_id=division_id,
+        stat_seq=stat_seq,
+        ranking_period=ranking_period,
+    )
     try:
-        html = fetch(url, namespace=f"ncaa_stats/individual_stats/{year}")
+        html = fetch(url, namespace=f"ncaa_stats/player_rankings/{year}")
+        players = _parse_ranking_page_players(html)
+        sample = [p["player_name"] for p in players[:5]]
+        log.info(
+            "player ranking page year=%s: found %d players, sample=%s",
+            year,
+            len(players),
+            sample,
+        )
+        return players
     except FetchError as e:
-        log.debug("contest %s: individual_stats skipped (%s)", contest_id, e)
+        log.warning("player ranking page year=%s: %s", year, e)
         return []
-    except Exception as e:  # noqa: BLE001
-        log.warning("contest %s: individual_stats error: %s", contest_id, e)
-        return []
-    return _parse_player_links(html)
 
 
 def build_ncaa_player_map(
-    contest_ids: list[str],
     year: int,
+    division_id: int = 1,
     *,
-    max_contests: int | None = None,
+    stat_seq: int = 271,
+    ranking_period: int | None = None,
 ) -> pd.DataFrame:
-    """Build an ``{ncaa_player_id, player_name}`` table from game individual-stats pages.
+    """Build an ``{ncaa_player_id, player_name, stats_ncaa_team_id}`` table.
 
-    Fetches ``INDIVIDUAL_STATS_URL`` for each contest (these are separate from
-    the ``box_score`` pages cached for team discovery) and collects every
-    ``/player/{id}`` link found.  Returns a DataFrame deduped by
-    ``ncaa_player_id``, keeping the first name seen for each ID.
+    Uses the national individual-player ranking page (``stat_seq=271``,
+    individual batting average) which is server-rendered and lists every
+    qualifying batter in the division with both player and team links per row.
+
+    Requires ``ranking_period`` — the year-specific period ID from
+    ``WSB_D1_RANKING_PERIOD`` in config.py.  Returns an empty DataFrame if
+    ``ranking_period`` is None or the page is unavailable.
     """
-    batch = [str(c) for c in contest_ids]
-    if max_contests is not None:
-        batch = batch[:max_contests]
-
-    log.info("player map: scanning %d individual_stats pages", len(batch))
-
-    def _fetch(cid: str) -> list[dict[str, str]]:
-        return fetch_players_from_contest(cid, year)
-
-    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
-        results = list(exe.map(_fetch, batch))
-
-    all_players: list[dict[str, str]] = [rec for recs in results for rec in recs]
-    if not all_players:
-        log.warning("player map: no players found from %d individual_stats pages", len(batch))
+    if ranking_period is None:
+        log.warning("player map: ranking_period not set for year %s — skipping", year)
         return pd.DataFrame()
 
-    df = pd.DataFrame(all_players).drop_duplicates(subset=["ncaa_player_id"])
-    sample = df["player_name"].head(5).tolist()
-    log.info(
-        "player map: %d unique players from %d contests, sample names=%s",
-        len(df),
-        len(batch),
-        sample,
-    )
+    players = _discover_players_via_ranking(year, division_id, stat_seq, ranking_period)
+    if not players:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(players)
+    log.info("player map year=%s: %d unique players", year, len(df))
     return df.reset_index(drop=True)
 
 
@@ -297,5 +321,4 @@ __all__ = [
     "ROSTER_URL",
     "build_ncaa_player_map",
     "discover_team_season_ids",
-    "fetch_players_from_contest",
 ]
