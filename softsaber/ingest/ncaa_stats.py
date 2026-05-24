@@ -68,7 +68,9 @@ NATIONAL_RANKING_URL = (
 # --- Link parsing ------------------------------------------------------------
 
 _TEAM_LINK_RE = re.compile(r"/teams/(\d+)")
-_PLAYER_LINK_RE = re.compile(r"/player/(\d+)")
+# stats.ncaa.org uses /players/{id} (plural) on roster and team pages,
+# and /player/{id} (singular) on some older pages — match both.
+_PLAYER_LINK_RE = re.compile(r"/players?/(\d+)")
 
 
 def _parse_team_links(html: str) -> dict[str, str]:
@@ -105,6 +107,114 @@ def _parse_team_links(html: str) -> dict[str, str]:
         sample = list(result.items())[:5]
         log.debug("_parse_team_links: %d entries, sample=%s", len(result), sample)
     return result
+
+
+# --- Roster scraping ---------------------------------------------------------
+#
+# stats.ncaa.org/teams/{id}/roster is server-rendered HTML (the data is in the
+# page, not loaded by JS).  However, Akamai bot-detection serves a ~2 KB
+# challenge page to fresh curl_cffi sessions.  The challenge sets cookies in
+# the session; a second request with those cookies typically receives the real
+# page.  We detect the challenge by checking for a small response with no
+# <table> elements, then retry once with force=True to bypass the disk cache.
+
+_ROSTER_CHALLENGE_BYTE_LIMIT = 8_000  # real roster pages are 15–25 KB
+
+
+def _parse_roster_html(html: str, team_season_id: str) -> pd.DataFrame:
+    """Parse the /teams/{id}/roster HTML into a per-player DataFrame.
+
+    Two-pass approach:
+    1. ``pd.read_html`` for the tabular data.
+    2. lxml scan for ``/players/{id}`` hrefs (``read_html`` discards links).
+    """
+    import io
+
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except Exception:
+        tables = []
+
+    if not tables:
+        return pd.DataFrame()
+
+    df = max(tables, key=len).copy()
+    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
+
+    rename = {
+        "#": "jersey", "no.": "jersey", "no": "jersey",
+        "name": "player_name", "player": "player_name",
+        "pos": "position", "position": "position",
+        "yr": "class_year", "cl": "class_year", "class": "class_year",
+        "ht": "height", "hometown": "hometown", "high_school": "high_school",
+    }
+    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
+    df["team_season_id"] = team_season_id
+
+    player_ids: list[str | None] = []
+    try:
+        tree = lxml_html.fromstring(html)
+        for a in tree.xpath('//a[contains(@href, "/players/")]'):
+            m = _PLAYER_LINK_RE.search(str(a.get("href") or ""))
+            if m:
+                player_ids.append(m.group(1))
+    except Exception:
+        pass
+
+    if len(player_ids) == len(df):
+        df["ncaa_player_id"] = player_ids
+    elif player_ids:
+        log.debug(
+            "team %s: %d player links vs %d table rows — skipping ID join",
+            team_season_id, len(player_ids), len(df),
+        )
+
+    return df.reset_index(drop=True)
+
+
+def fetch_team_roster(
+    team_season_id: str,
+    year: int,
+    *,
+    force: bool = False,
+) -> pd.DataFrame:
+    """Fetch and parse the roster for one team-season.
+
+    Akamai bot-detection may serve a short challenge page on the first request.
+    We detect this (response < ``_ROSTER_CHALLENGE_BYTE_LIMIT`` bytes) and
+    retry once; the second request includes the session cookies set by the
+    challenge, which is often sufficient to get the real page.
+    """
+    url = ROSTER_URL.format(team_season_id=team_season_id)
+    ns = f"ncaa_stats/rosters/{year}"
+
+    def _attempt(force_flag: bool) -> str | None:
+        try:
+            return fetch(url, namespace=ns, force=force_flag)
+        except FetchError as e:
+            log.warning("roster team_season_id=%s: %s", team_season_id, e)
+            return None
+        except Exception as e:  # noqa: BLE001
+            log.warning("roster team_season_id=%s: unexpected error: %s", team_season_id, e)
+            return None
+
+    html = _attempt(force)
+    if html is None:
+        return pd.DataFrame()
+
+    # If response looks like an Akamai challenge page, retry once.
+    if len(html) < _ROSTER_CHALLENGE_BYTE_LIMIT:
+        log.debug(
+            "roster team_season_id=%s: short response (%d bytes), retrying for real page",
+            team_season_id, len(html),
+        )
+        html2 = _attempt(force_flag=True)
+        if html2 and len(html2) > len(html):
+            html = html2
+
+    df = _parse_roster_html(html, team_season_id)
+    log.info("roster team_season_id=%s: %d players", team_season_id, len(df))
+    return df
 
 
 # --- Discovery ---------------------------------------------------------------
@@ -205,4 +315,5 @@ __all__ = [
     "NATIONAL_RANKING_URL",
     "ROSTER_URL",
     "discover_team_season_ids",
+    "fetch_team_roster",
 ]

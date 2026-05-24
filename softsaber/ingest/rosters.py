@@ -190,60 +190,83 @@ def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _try_ncaa_rosters(teams: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Attempt to fetch rosters from stats.ncaa.org/teams/{id}/roster.
+
+    Returns a combined DataFrame, or empty if the WAF blocks all requests.
+    The Akamai challenge page is ~2 KB; fetch_team_roster retries once after
+    the first request sets session cookies, which often bypasses the block.
+    Requires ``stats_ncaa_team_id`` to be populated in ``teams``.
+    """
+    eligible = teams[teams["stats_ncaa_team_id"].notna()].copy()
+    if eligible.empty:
+        return pd.DataFrame()
+
+    log.info("rosters: trying stats.ncaa.org for %d teams", len(eligible))
+
+    def _fetch(row) -> pd.DataFrame:  # type: ignore[type-arg]
+        tid = str(row.stats_ncaa_team_id)
+        df = ncaa_stats.fetch_team_roster(tid, year)
+        if df.empty:
+            return df
+        df["team_name"] = row.team_name
+        df["stats_ncaa_team_id"] = tid
+        df["season"] = year
+        return df
+
+    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        results = list(exe.map(_fetch, eligible.itertuples(index=False)))
+
+    frames = [df for df in results if not df.empty]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
 def ingest_season_rosters(
     teams: pd.DataFrame,
     games: pd.DataFrame,
     year: int,
 ) -> pd.DataFrame:
-    """Build the season roster from henrygd boxscore data.
+    """Build the season roster, preferring stats.ncaa.org, falling back to henrygd.
 
-    stats.ncaa.org is inaccessible (WAF / login wall).  Instead, we fetch the
-    henrygd boxscore for every game in ``games`` — these are already cached
-    from the ``ingest boxscore`` step — and collect every player who appeared.
-    Deduplication on ``(last_name, first_name, team_seoname)`` gives one row
-    per unique player per team.
+    **Primary**: fetches stats.ncaa.org/teams/{id}/roster for each team with a
+    known ``stats_ncaa_team_id``.  The page is server-rendered; a one-retry
+    pattern handles the Akamai bot-challenge that appears on the first request.
+    Yields ``ncaa_player_id``, jersey, position, class_year, and full name.
+
+    **Fallback**: if the NCAA site is fully blocked, we build the roster from
+    the henrygd boxscore API (already cached).  This gives first_name,
+    last_name, jersey, and position but no ``ncaa_player_id``.
 
     Writes ``rosters/{year}.parquet`` and returns the combined DataFrame.
     """
-    game_ids = games["game_id"].astype(str).tolist()
-    log.info("rosters: building from boxscores for %d games", len(game_ids))
+    combined = _try_ncaa_rosters(teams, year)
 
-    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
-        results = list(exe.map(_boxscore_to_player_rows, game_ids))
-
-    frames = [df for df in results if not df.empty]
-    if not frames:
-        log.warning("rosters year=%s: no player data from boxscores", year)
-        return pd.DataFrame()
-
-    combined = pd.concat(frames, ignore_index=True)
-
-    # Deduplicate: one row per unique player per team.
-    dedup_cols = ["last_name", "first_name", "team_seoname"]
-    combined = (
-        combined
-        .sort_values(["team_seoname", "last_name", "first_name", "jersey"])
-        .drop_duplicates(subset=dedup_cols, keep="first")
-        .reset_index(drop=True)
-    )
+    if combined.empty:
+        log.info("rosters: NCAA fetch yielded nothing — falling back to henrygd boxscores")
+        game_ids = games["game_id"].astype(str).tolist()
+        with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+            results = list(exe.map(_boxscore_to_player_rows, game_ids))
+        frames = [df for df in results if not df.empty]
+        if not frames:
+            log.warning("rosters year=%s: no player data from any source", year)
+            return pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True)
+        dedup_cols = ["last_name", "first_name", "team_seoname"]
+        combined = (
+            combined
+            .sort_values(["team_seoname", "last_name", "first_name", "jersey"])
+            .drop_duplicates(subset=dedup_cols, keep="first")
+            .reset_index(drop=True)
+        )
+        if "team_seoname" in teams.columns and "team_name" in teams.columns:
+            seo_to_name = teams.set_index("team_seoname")["team_name"].to_dict()
+            mask = combined["team_name"].eq("") | combined["team_name"].isna()
+            combined.loc[mask, "team_name"] = combined.loc[mask, "team_seoname"].map(seo_to_name)
 
     combined["season"] = year
-
-    # If teams table has team_name keyed by seoname, fill gaps.
-    if "team_seoname" in teams.columns and "team_name" in teams.columns:
-        seo_to_name = teams.set_index("team_seoname")["team_name"].to_dict()
-        mask = combined["team_name"].eq("") | combined["team_name"].isna()
-        combined.loc[mask, "team_name"] = combined.loc[mask, "team_seoname"].map(seo_to_name)
-
     storage.write_partition("rosters", str(year), combined)
-    sample = combined["player_name"].head(5).tolist()
-    log.info(
-        "rosters year=%s: wrote %d unique players from %d games, sample=%s",
-        year,
-        len(combined),
-        len(game_ids),
-        sample,
-    )
+    sample = combined.get("player_name", combined.get("last_name", pd.Series())).head(5).tolist()
+    log.info("rosters year=%s: wrote %d player rows, sample=%s", year, len(combined), sample)
     return combined
 
 
