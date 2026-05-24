@@ -271,6 +271,18 @@ def stats_wrc(
         raise SystemExit("no pbp_raw partitions found — run `ingest pbp` first")
 
     pa = build_pa_table(pbp)
+
+    from .parse.pa import resolve_batter_names
+    game_players = storage.read_table("game_players", partitions=[str(s) for s in seasons])
+    if not game_players.empty:
+        pa = resolve_batter_names(pa, game_players)
+    else:
+        typer.echo(
+            "warning: no game_players data — batter names will be raw PBP tokens. "
+            "Run `ingest boxscore` to enable name resolution.",
+            err=True,
+        )
+
     re = compute_re_matrix(pa)
     pa_re24 = compute_re24(pa, re)
     weights = compute_linear_weights(pa_re24)
