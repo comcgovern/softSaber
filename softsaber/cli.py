@@ -22,6 +22,7 @@ import typer
 from .config import Season, TARGET_DIVISION, TARGET_SEASONS
 from .ingest import boxscore as boxscore_mod
 from .ingest import pbp as pbp_mod
+from .ingest import rosters as rosters_mod
 from .ingest import scoreboard as scoreboard_mod
 from .ingest import teams as teams_mod
 
@@ -149,16 +150,16 @@ def ingest_boxscore(
     ] = None,
     verbose: bool = False,
 ) -> None:
-    """Warm the boxscore cache for every game in the matching games partition.
+    """Fetch and parse boxscores for every game in the matching games partition.
 
-    Boxscores aren't parsed into parquet yet — this just populates the raw
-    JSON cache (``data/raw/ncaa_api/boxscore/``) for downstream use.
+    Populates the raw JSON cache (``data/raw/ncaa_api/boxscore/``) and writes
+    a ``game_players`` parquet partition with per-player batting/pitching lines.
     """
     _setup_logging(verbose)
     d = _parse_date(day) if day else None
     year = _resolve_season(season, d, "ingest boxscore")
-    games, _ = _games_for(year, d)
-    n = boxscore_mod.ingest_boxscores_for_games(games)
+    games, partition = _games_for(year, d)
+    n = boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
     typer.echo(f"boxscores cached: {n}")
 
 
@@ -195,7 +196,7 @@ def ingest_all(
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
         teams_mod.build_teams_table(softball_ids, d.year)
         pbp_mod.ingest_pbp_for_games(games, d.year, partition)
-        boxscore_mod.ingest_boxscores_for_games(games)
+        boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
         return
 
     years = seasons if seasons else list(TARGET_SEASONS)
@@ -206,7 +207,45 @@ def ingest_all(
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
         teams_mod.build_teams_table(softball_ids, year)
         pbp_mod.ingest_season_pbp(games, year)
-        boxscore_mod.ingest_boxscores_for_games(games)
+        boxscore_mod.ingest_boxscores_for_games(games, partition=str(year))
+
+
+@ingest_app.command("rosters")
+def ingest_rosters(
+    season: Annotated[int | None, typer.Option(help="Season year.")] = None,
+    day: Annotated[
+        str | None,
+        typer.Option("--date", help="Infer season year from this date (YYYY-MM-DD)."),
+    ] = None,
+    verbose: bool = False,
+) -> None:
+    """Discover stats.ncaa.org team IDs and fetch per-player rosters.
+
+    Reads the games and teams partitions for the season, probes the
+    stats.ncaa.org individual-stats pages for each game to discover
+    year-specific team IDs, then fetches each team's roster page to get
+    player names and NCAA player IDs.
+
+    Writes an updated ``teams/{season}.parquet`` (with ``stats_ncaa_team_id``)
+    and a ``rosters/{season}.parquet`` (one row per player).
+
+    Tip: fill in ``WSB_D1_RANKING_STAT_SEQ`` in ``config.py`` to enable
+    full-division discovery in a single request instead of per-game pages.
+    """
+    from . import storage
+
+    _setup_logging(verbose)
+    d = _parse_date(day) if day else None
+    year = _resolve_season(season, d, "ingest rosters")
+
+    games, _ = _games_for(year, d)
+    teams = storage.read_table("teams", partitions=[str(year)])
+    if teams.empty:
+        raise SystemExit(f"no teams partition for {year} — run `ingest teams` first")
+
+    teams = rosters_mod.discover_and_update_teams(teams, games, year)
+    df = rosters_mod.ingest_season_rosters(teams, games, year)
+    typer.echo(f"roster rows written: {len(df)}")
 
 
 @stats_app.command("wrc")
@@ -232,6 +271,18 @@ def stats_wrc(
         raise SystemExit("no pbp_raw partitions found — run `ingest pbp` first")
 
     pa = build_pa_table(pbp)
+
+    from .parse.pa import resolve_batter_names
+    game_players = storage.read_table("game_players", partitions=[str(s) for s in seasons])
+    if not game_players.empty:
+        pa = resolve_batter_names(pa, game_players)
+    else:
+        typer.echo(
+            "warning: no game_players data — batter names will be raw PBP tokens. "
+            "Run `ingest boxscore` to enable name resolution.",
+            err=True,
+        )
+
     re = compute_re_matrix(pa)
     pa_re24 = compute_re24(pa, re)
     weights = compute_linear_weights(pa_re24)

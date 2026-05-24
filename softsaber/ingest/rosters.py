@@ -1,75 +1,276 @@
-"""Roster ingest — needed to map batter-name strings in PBP back to player IDs.
+"""Season roster ingest — builds a per-season player table from boxscore data.
 
-stats.ncaa.org exposes a roster page per team-season at
-``/teams/{softball_id}/roster`` (the exact path is what softballR's
-``load_ncaa_softball_rosters`` resolves under the hood). The roster gives us
-jersey number, full name, position, class, and a player-level ID we'll need
-for season aggregation later.
+stats.ncaa.org is behind a WAF that blocks non-browser clients (roster and
+ranking pages all return 403 or empty JS shells).  This module instead builds
+rosters from the henrygd boxscore API, which we already call for every game.
 
-This module is left as a small functional stub: the canonical URL pattern is
-recorded here, and we wire up a parquet writer with the expected schema so
-the stats layer can be developed against fixtures while we firm up the
-scraping details against a real page.
+The boxscore for each game carries first_name, last_name, jersey, position,
+and team for every player who appeared.  Deduplicating across all games in the
+season gives us a complete per-season roster for every team.
+
+Output parquet schema (``rosters/{season}``):
+
+    season, team_name, team_seoname, team_id,
+    first_name, last_name, player_name, jersey, position
 """
 
 from __future__ import annotations
 
-import io
 import logging
+import re
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
 from .. import storage
-from ..http_cache import fetch
+from ..config import HENRYGD_WORKERS, NCAA_STATS_WORKERS
+from . import ncaa_api, ncaa_stats
 
 log = logging.getLogger(__name__)
 
-ROSTER_URL_FMT = "https://stats.ncaa.org/teams/{softball_id}/roster"
+
+# ---------------------------------------------------------------------------
+# Team-name normalisation (kept for discover_and_update_teams)
+# ---------------------------------------------------------------------------
+
+_ABBREV_REPLACEMENTS = [
+    (re.compile(r"\bst\.?\b"), "state"),
+    (re.compile(r"\buniv\.?\b"), "university"),
+    (re.compile(r"\bcoll\.?\b"), "college"),
+    (re.compile(r"\bn\.?\s*c\.?\b"), "north carolina"),
+    (re.compile(r"\bs\.?\s*c\.?\b"), "south carolina"),
+    (re.compile(r"\btex\.?\b"), "texas"),
+    (re.compile(r"\bcal\.?\b"), "california"),
+    (re.compile(r"\bmiss\.?\b"), "mississippi"),
+    (re.compile(r"\bfla\.?\b"), "florida"),
+    (re.compile(r"\bla\.?\b"), "louisiana"),
+    (re.compile(r"\bga\.?\b"), "georgia"),
+    (re.compile(r"\bva\.?\b"), "virginia"),
+    (re.compile(r"\bky\.?\b"), "kentucky"),
+    (re.compile(r"\bark\.?\b"), "arkansas"),
+    (re.compile(r"\bmich\.?\b"), "michigan"),
+    (re.compile(r"\bwash\.?\b"), "washington"),
+    (re.compile(r"\bind\.?\b"), "indiana"),
+    (re.compile(r"\b&\b"), "and"),
+]
 
 
-def fetch_team_roster(softball_id: str, season: int) -> pd.DataFrame:
-    """Fetch a single team's roster table.
+def _normalize_team_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    s = name.lower().strip()
+    for pat, repl in _ABBREV_REPLACEMENTS:
+        s = pat.sub(repl, s)
+    s = re.sub(r"[^\w\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
 
-    NOTE: The exact column set varies year to year as NCAA updates the page.
-    We normalize to a minimal schema here and pass through any extras as
-    columns prefixed with ``raw_``.
+
+# ---------------------------------------------------------------------------
+# Team-ID discovery (unchanged — still useful for enriching teams table)
+# ---------------------------------------------------------------------------
+
+def discover_and_update_teams(
+    teams: pd.DataFrame,
+    games: pd.DataFrame,
+    year: int,
+) -> pd.DataFrame:
+    """Discover ``stats_ncaa_team_id`` for each team and write an updated teams table.
+
+    Uses ``contestId`` values from ``games`` as the primary discovery path.
+    Falls back to the national ranking page when ranking config is available.
+
+    Returns the updated teams DataFrame with a ``stats_ncaa_team_id`` column.
     """
-    url = ROSTER_URL_FMT.format(softball_id=softball_id)
-    html = fetch(url, namespace=f"roster/{season}")
-    tables = pd.read_html(io.StringIO(html))
-    if not tables:
-        log.warning("roster %s: no tables found", softball_id)
+    from ..config import WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
+
+    contest_ids = games["game_id"].astype(str).tolist()
+    ranking_period = WSB_D1_RANKING_PERIOD.get(year)
+
+    id_map = ncaa_stats.discover_team_season_ids(
+        year,
+        division_id=1,
+        contest_ids=contest_ids,
+        stat_seq=WSB_D1_RANKING_STAT_SEQ,
+        ranking_period=ranking_period,
+    )
+
+    teams = teams.copy()
+    if not id_map:
+        log.warning("year %s: no stats_ncaa_team_id found via contest or ranking pages", year)
+        if "stats_ncaa_team_id" not in teams.columns:
+            teams["stats_ncaa_team_id"] = None
+        return teams
+
+    normalised_map: dict[str, str] = {
+        _normalize_team_name(n): tid for n, tid in id_map.items()
+    }
+
+    def _lookup(name: str) -> str | None:
+        if name in id_map:
+            return id_map[name]
+        return normalised_map.get(_normalize_team_name(name))
+
+    teams["stats_ncaa_team_id"] = teams["team_name"].apply(_lookup)
+    matched = teams["stats_ncaa_team_id"].notna().sum()
+    log.info("year %s: matched stats_ncaa_team_id for %d/%d teams", year, matched, len(teams))
+    unmatched = teams[teams["stats_ncaa_team_id"].isna()]["team_name"].tolist()
+    if unmatched:
+        log.warning(
+            "year %s: %d teams without stats_ncaa_team_id — "
+            "unmatched henrygd names: %s | sample ncaa names: %s",
+            year,
+            len(unmatched),
+            unmatched,
+            list(id_map.keys())[:10],
+        )
+
+    storage.write_partition("teams", str(year), teams)
+    return teams
+
+
+# ---------------------------------------------------------------------------
+# Roster extraction from boxscore data
+# ---------------------------------------------------------------------------
+
+def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
+    """Fetch one game's boxscore and return a per-player DataFrame.
+
+    Uses cached data when available; makes a live request otherwise.
+    """
+    import json
+
+    from ..http_cache import FetchError, fetch
+    from . import ncaa_api as _api
+
+    url = f"{ncaa_api.SCOREBOARD_HOST}/game/{game_id}/boxscore"
+    try:
+        text = fetch(url, namespace="ncaa_api/boxscore", ext="json")
+        payload = json.loads(text)
+    except Exception as e:
+        log.debug("game %s: boxscore unavailable for roster build: %s", game_id, e)
         return pd.DataFrame()
 
-    df = tables[0].copy()
-    df.columns = [str(c).strip().lower().replace(" ", "_") for c in df.columns]
-    rename = {
-        "jersey": "jersey",
-        "player": "player_name",
-        "name": "player_name",
-        "pos": "position",
-        "position": "position",
-        "yr": "class_year",
-        "class": "class_year",
-    }
-    df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
-    df["softball_id"] = softball_id
-    df["season"] = season
-    return df
+    rows = []
+    team_meta: dict[str, dict] = {}
+    for t in payload.get("teams") or []:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("teamId", ""))
+        team_meta[tid] = {
+            "team_seoname": str(t.get("seoname") or ""),
+            "team_name": str(t.get("name") or ""),
+            "is_home": bool(t.get("isHome")),
+        }
+
+    for team_box in payload.get("teamBoxscore") or []:
+        if not isinstance(team_box, dict):
+            continue
+        tid = str(team_box.get("teamId", ""))
+        meta = team_meta.get(tid, {})
+        for p in team_box.get("playerStats") or []:
+            if not isinstance(p, dict) or not p.get("participated"):
+                continue
+            first = str(p.get("firstName") or "").strip()
+            last = str(p.get("lastName") or "").strip()
+            if not first and not last:
+                continue
+            rows.append(
+                {
+                    "team_id": tid,
+                    "team_seoname": meta.get("team_seoname", ""),
+                    "team_name": meta.get("team_name", ""),
+                    "first_name": first,
+                    "last_name": last,
+                    "player_name": f"{first} {last}".strip(),
+                    "jersey": p.get("number"),
+                    "position": str(p.get("position") or "").strip(),
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
-def ingest_season_rosters(team_ids: pd.DataFrame, season: int) -> pd.DataFrame:
-    """``team_ids`` must have columns ``softball_id`` and ``team_name``."""
-    frames = []
-    for _, row in team_ids.iterrows():
-        try:
-            r = fetch_team_roster(str(row["softball_id"]), season)
-            if not r.empty:
-                r["team_name"] = row["team_name"]
-                frames.append(r)
-        except Exception as e:  # noqa: BLE001
-            log.warning("roster team %s failed: %s", row["softball_id"], e, exc_info=log.isEnabledFor(logging.DEBUG))
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if not df.empty:
-        storage.write_partition("rosters", str(season), df)
-    return df
+def _try_ncaa_rosters(teams: pd.DataFrame, year: int) -> pd.DataFrame:
+    """Attempt to fetch rosters from stats.ncaa.org/teams/{id}/roster.
+
+    Returns a combined DataFrame, or empty if the WAF blocks all requests.
+    The Akamai challenge page is ~2 KB; fetch_team_roster retries once after
+    the first request sets session cookies, which often bypasses the block.
+    Requires ``stats_ncaa_team_id`` to be populated in ``teams``.
+    """
+    eligible = teams[teams["stats_ncaa_team_id"].notna()].copy()
+    if eligible.empty:
+        return pd.DataFrame()
+
+    log.info("rosters: trying stats.ncaa.org for %d teams", len(eligible))
+
+    def _fetch(row) -> pd.DataFrame:  # type: ignore[type-arg]
+        tid = str(row.stats_ncaa_team_id)
+        df = ncaa_stats.fetch_team_roster(tid, year)
+        if df.empty:
+            return df
+        df["team_name"] = row.team_name
+        df["stats_ncaa_team_id"] = tid
+        df["season"] = year
+        return df
+
+    with ThreadPoolExecutor(max_workers=NCAA_STATS_WORKERS) as exe:
+        results = list(exe.map(_fetch, eligible.itertuples(index=False)))
+
+    frames = [df for df in results if not df.empty]
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def ingest_season_rosters(
+    teams: pd.DataFrame,
+    games: pd.DataFrame,
+    year: int,
+) -> pd.DataFrame:
+    """Build the season roster, preferring stats.ncaa.org, falling back to henrygd.
+
+    **Primary**: fetches stats.ncaa.org/teams/{id}/roster for each team with a
+    known ``stats_ncaa_team_id``.  The page is server-rendered; a one-retry
+    pattern handles the Akamai bot-challenge that appears on the first request.
+    Yields ``ncaa_player_id``, jersey, position, class_year, and full name.
+
+    **Fallback**: if the NCAA site is fully blocked, we build the roster from
+    the henrygd boxscore API (already cached).  This gives first_name,
+    last_name, jersey, and position but no ``ncaa_player_id``.
+
+    Writes ``rosters/{year}.parquet`` and returns the combined DataFrame.
+    """
+    combined = _try_ncaa_rosters(teams, year)
+
+    if combined.empty:
+        log.info("rosters: NCAA fetch yielded nothing — falling back to henrygd boxscores")
+        game_ids = games["game_id"].astype(str).tolist()
+        with ThreadPoolExecutor(max_workers=HENRYGD_WORKERS) as exe:
+            results = list(exe.map(_boxscore_to_player_rows, game_ids))
+        frames = [df for df in results if not df.empty]
+        if not frames:
+            log.warning("rosters year=%s: no player data from any source", year)
+            return pd.DataFrame()
+        combined = pd.concat(frames, ignore_index=True)
+        dedup_cols = ["last_name", "first_name", "team_seoname"]
+        combined = (
+            combined
+            .sort_values(["team_seoname", "last_name", "first_name", "jersey"])
+            .drop_duplicates(subset=dedup_cols, keep="first")
+            .reset_index(drop=True)
+        )
+        if "team_seoname" in teams.columns and "team_name" in teams.columns:
+            seo_to_name = teams.set_index("team_seoname")["team_name"].to_dict()
+            mask = combined["team_name"].eq("") | combined["team_name"].isna()
+            combined.loc[mask, "team_name"] = combined.loc[mask, "team_seoname"].map(seo_to_name)
+
+    combined["season"] = year
+    storage.write_partition("rosters", str(year), combined)
+    sample = combined.get("player_name", combined.get("last_name", pd.Series())).head(5).tolist()
+    log.info("rosters year=%s: wrote %d player rows, sample=%s", year, len(combined), sample)
+    return combined
+
+
+__all__ = [
+    "discover_and_update_teams",
+    "ingest_season_rosters",
+]
