@@ -1,40 +1,38 @@
-"""Season roster ingest — maps stats.ncaa.org ncaa_player_id to player names.
+"""Season roster ingest — builds a per-season player table from boxscore data.
 
-The pipeline has two steps:
+stats.ncaa.org is behind a WAF that blocks non-browser clients (roster and
+ranking pages all return 403 or empty JS shells).  This module instead builds
+rosters from the henrygd boxscore API, which we already call for every game.
 
-1. **Team ID discovery** — :func:`discover_and_update_teams` fetches per-game
-   stats pages on stats.ncaa.org and parses ``/teams/{year_specific_id}``
-   links, writing ``stats_ncaa_team_id`` back to the teams partition.
-
-2. **Player ID extraction** — stats.ncaa.org/teams/{id}/roster pages are
-   JavaScript-rendered (2 KB empty shell).  Instead, the national individual
-   player ranking page (``stat_seq=271``, batting average) is fetched; it is
-   server-rendered and has one ``/player/{id}`` + one ``/teams/{id}`` link per
-   row, giving us ncaa_player_id, player name, and team in a single request.
+The boxscore for each game carries first_name, last_name, jersey, position,
+and team for every player who appeared.  Deduplicating across all games in the
+season gives us a complete per-season roster for every team.
 
 Output parquet schema (``rosters/{season}``):
 
-    season, ncaa_player_id, player_name, stats_ncaa_team_id, team_name
+    season, team_name, team_seoname, team_id,
+    first_name, last_name, player_name, jersey, position
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import pandas as pd
 
 from .. import storage
-from ..config import WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
-from . import ncaa_stats
+from ..config import REQUEST_WORKERS
+from . import ncaa_api, ncaa_stats
 
 log = logging.getLogger(__name__)
 
 
-# NCAA.com (henrygd) and stats.ncaa.org disagree on team-name formatting:
-# the former uses abbreviations like "Penn St." and "N.C. State"; the latter
-# spells things out as "Penn State" and "North Carolina State".  Normalising
-# both sides through the same set of substitutions lets us join cleanly.
+# ---------------------------------------------------------------------------
+# Team-name normalisation (kept for discover_and_update_teams)
+# ---------------------------------------------------------------------------
+
 _ABBREV_REPLACEMENTS = [
     (re.compile(r"\bst\.?\b"), "state"),
     (re.compile(r"\buniv\.?\b"), "university"),
@@ -58,7 +56,6 @@ _ABBREV_REPLACEMENTS = [
 
 
 def _normalize_team_name(name: str) -> str:
-    """Lower-case, expand common abbreviations, strip punctuation and whitespace."""
     if not isinstance(name, str):
         return ""
     s = name.lower().strip()
@@ -68,6 +65,10 @@ def _normalize_team_name(name: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# ---------------------------------------------------------------------------
+# Team-ID discovery (unchanged — still useful for enriching teams table)
+# ---------------------------------------------------------------------------
+
 def discover_and_update_teams(
     teams: pd.DataFrame,
     games: pd.DataFrame,
@@ -75,43 +76,34 @@ def discover_and_update_teams(
 ) -> pd.DataFrame:
     """Discover ``stats_ncaa_team_id`` for each team and write an updated teams table.
 
-    Uses ``contestId`` values from ``games`` as the primary discovery path
-    (no config needed) and falls back to the national ranking page when
-    ``WSB_D1_RANKING_STAT_SEQ[year]`` is configured.
+    Uses ``contestId`` values from ``games`` as the primary discovery path.
+    Falls back to the national ranking page when ranking config is available.
 
     Returns the updated teams DataFrame with a ``stats_ncaa_team_id`` column.
     """
+    from ..config import WSB_D1_RANKING_PERIOD, WSB_D1_RANKING_STAT_SEQ
+
     contest_ids = games["game_id"].astype(str).tolist()
     ranking_period = WSB_D1_RANKING_PERIOD.get(year)
 
-    division_id = 1  # D1 hardcoded; extend via Season.division_code if needed
     id_map = ncaa_stats.discover_team_season_ids(
         year,
-        division_id=division_id,
+        division_id=1,
         contest_ids=contest_ids,
         stat_seq=WSB_D1_RANKING_STAT_SEQ,
         ranking_period=ranking_period,
     )
 
+    teams = teams.copy()
     if not id_map:
-        log.warning(
-            "year %s: no stats_ncaa_team_id found — roster fetch will be skipped. "
-            "If the contest pages returned 404s, check that CONTEST_STATS_URL is "
-            "correct for the current NCAA site layout.",
-            year,
-        )
-        teams = teams.copy()
+        log.warning("year %s: no stats_ncaa_team_id found via contest or ranking pages", year)
         if "stats_ncaa_team_id" not in teams.columns:
             teams["stats_ncaa_team_id"] = None
         return teams
 
-    teams = teams.copy()
-
-    # Match in two passes: first exact, then normalised (handles "St."/"State"
-    # and similar abbreviation drift between ncaa.com and stats.ncaa.org).
-    normalised_map: dict[str, str] = {}
-    for raw_name, tid in id_map.items():
-        normalised_map[_normalize_team_name(raw_name)] = tid
+    normalised_map: dict[str, str] = {
+        _normalize_team_name(n): tid for n, tid in id_map.items()
+    }
 
     def _lookup(name: str) -> str | None:
         if name in id_map:
@@ -120,26 +112,82 @@ def discover_and_update_teams(
 
     teams["stats_ncaa_team_id"] = teams["team_name"].apply(_lookup)
     matched = teams["stats_ncaa_team_id"].notna().sum()
-    log.info(
-        "year %s: matched stats_ncaa_team_id for %d/%d teams",
-        year,
-        matched,
-        len(teams),
-    )
+    log.info("year %s: matched stats_ncaa_team_id for %d/%d teams", year, matched, len(teams))
     unmatched = teams[teams["stats_ncaa_team_id"].isna()]["team_name"].tolist()
     if unmatched:
-        sample_ncaa = list(id_map.keys())[:10]
         log.warning(
             "year %s: %d teams without stats_ncaa_team_id — "
             "unmatched henrygd names: %s | sample ncaa names: %s",
             year,
             len(unmatched),
             unmatched,
-            sample_ncaa,
+            list(id_map.keys())[:10],
         )
 
     storage.write_partition("teams", str(year), teams)
     return teams
+
+
+# ---------------------------------------------------------------------------
+# Roster extraction from boxscore data
+# ---------------------------------------------------------------------------
+
+def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
+    """Fetch one game's boxscore and return a per-player DataFrame.
+
+    Uses cached data when available; makes a live request otherwise.
+    """
+    import json
+
+    from ..http_cache import FetchError, fetch
+    from . import ncaa_api as _api
+
+    url = f"{ncaa_api.SCOREBOARD_HOST}/game/{game_id}/boxscore"
+    try:
+        text = fetch(url, namespace="ncaa_api/boxscore", ext="json")
+        payload = json.loads(text)
+    except Exception as e:
+        log.debug("game %s: boxscore unavailable for roster build: %s", game_id, e)
+        return pd.DataFrame()
+
+    rows = []
+    team_meta: dict[str, dict] = {}
+    for t in payload.get("teams") or []:
+        if not isinstance(t, dict):
+            continue
+        tid = str(t.get("teamId", ""))
+        team_meta[tid] = {
+            "team_seoname": str(t.get("seoname") or ""),
+            "team_name": str(t.get("name") or ""),
+            "is_home": bool(t.get("isHome")),
+        }
+
+    for team_box in payload.get("teamBoxscore") or []:
+        if not isinstance(team_box, dict):
+            continue
+        tid = str(team_box.get("teamId", ""))
+        meta = team_meta.get(tid, {})
+        for p in team_box.get("playerStats") or []:
+            if not isinstance(p, dict) or not p.get("participated"):
+                continue
+            first = str(p.get("firstName") or "").strip()
+            last = str(p.get("lastName") or "").strip()
+            if not first and not last:
+                continue
+            rows.append(
+                {
+                    "team_id": tid,
+                    "team_seoname": meta.get("team_seoname", ""),
+                    "team_name": meta.get("team_name", ""),
+                    "first_name": first,
+                    "last_name": last,
+                    "player_name": f"{first} {last}".strip(),
+                    "jersey": p.get("number"),
+                    "position": str(p.get("position") or "").strip(),
+                }
+            )
+
+    return pd.DataFrame(rows)
 
 
 def ingest_season_rosters(
@@ -147,43 +195,56 @@ def ingest_season_rosters(
     games: pd.DataFrame,
     year: int,
 ) -> pd.DataFrame:
-    """Build the player roster from the national individual-player ranking page.
+    """Build the season roster from henrygd boxscore data.
 
-    stats.ncaa.org/teams/{id}/roster pages are JavaScript-rendered (2 KB shell).
-    Instead, we fetch the ``stat_seq=271`` (individual batting average) ranking
-    page, which is server-rendered and carries one ``/player/{id}`` + one
-    ``/teams/{id}`` link per row, giving us ncaa_player_id, player name, and
-    team association in a single request.
-
-    ``teams`` must have ``team_name`` and ``stats_ncaa_team_id`` columns
-    (populated by :func:`discover_and_update_teams`).  ``games`` is accepted
-    for call-site compatibility but is not used by this implementation.
+    stats.ncaa.org is inaccessible (WAF / login wall).  Instead, we fetch the
+    henrygd boxscore for every game in ``games`` — these are already cached
+    from the ``ingest boxscore`` step — and collect every player who appeared.
+    Deduplication on ``(last_name, first_name, team_seoname)`` gives one row
+    per unique player per team.
 
     Writes ``rosters/{year}.parquet`` and returns the combined DataFrame.
     """
-    if "stats_ncaa_team_id" not in teams.columns:
-        log.warning("teams table has no stats_ncaa_team_id — run discover first")
+    game_ids = games["game_id"].astype(str).tolist()
+    log.info("rosters: building from boxscores for %d games", len(game_ids))
+
+    with ThreadPoolExecutor(max_workers=REQUEST_WORKERS) as exe:
+        results = list(exe.map(_boxscore_to_player_rows, game_ids))
+
+    frames = [df for df in results if not df.empty]
+    if not frames:
+        log.warning("rosters year=%s: no player data from boxscores", year)
         return pd.DataFrame()
 
-    ranking_period = WSB_D1_RANKING_PERIOD.get(year)
-    players = ncaa_stats.build_ncaa_player_map(year, ranking_period=ranking_period)
+    combined = pd.concat(frames, ignore_index=True)
 
-    if players.empty:
-        log.warning("rosters year=%s: no players found from player ranking page", year)
-        return pd.DataFrame()
-
-    # Join team name from the teams table via stats_ncaa_team_id.
-    tid_to_name: dict[str, str] = (
-        teams[teams["stats_ncaa_team_id"].notna()]
-        .set_index("stats_ncaa_team_id")["team_name"]
-        .to_dict()
+    # Deduplicate: one row per unique player per team.
+    dedup_cols = ["last_name", "first_name", "team_seoname"]
+    combined = (
+        combined
+        .sort_values(["team_seoname", "last_name", "first_name", "jersey"])
+        .drop_duplicates(subset=dedup_cols, keep="first")
+        .reset_index(drop=True)
     )
-    players["team_name"] = players["stats_ncaa_team_id"].map(tid_to_name)
-    players["season"] = year
 
-    storage.write_partition("rosters", str(year), players)
-    log.info("rosters year=%s: wrote %d player rows", year, len(players))
-    return players
+    combined["season"] = year
+
+    # If teams table has team_name keyed by seoname, fill gaps.
+    if "team_seoname" in teams.columns and "team_name" in teams.columns:
+        seo_to_name = teams.set_index("team_seoname")["team_name"].to_dict()
+        mask = combined["team_name"].eq("") | combined["team_name"].isna()
+        combined.loc[mask, "team_name"] = combined.loc[mask, "team_seoname"].map(seo_to_name)
+
+    storage.write_partition("rosters", str(year), combined)
+    sample = combined["player_name"].head(5).tolist()
+    log.info(
+        "rosters year=%s: wrote %d unique players from %d games, sample=%s",
+        year,
+        len(combined),
+        len(game_ids),
+        sample,
+    )
+    return combined
 
 
 __all__ = [

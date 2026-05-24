@@ -107,121 +107,6 @@ def _parse_team_links(html: str) -> dict[str, str]:
     return result
 
 
-def _parse_ranking_page_players(html: str) -> list[dict[str, str]]:
-    """Extract player records from an individual-player national ranking page.
-
-    Each table row on stat_seq=271 (individual batting average) has one
-    ``/player/{id}`` link (the player) and one ``/teams/{id}`` link (their
-    team).  We scan per-row so the two links are reliably paired, giving us
-    ``ncaa_player_id``, ``player_name``, and ``stats_ncaa_team_id`` in one
-    pass.
-
-    This page is server-rendered (same infrastructure as the team-batting
-    ranking page that successfully returns 300+ team links).
-    """
-    try:
-        tree = lxml_html.fromstring(html)
-    except Exception:
-        return []
-
-    players: list[dict[str, str]] = []
-    seen: set[str] = set()
-
-    for row in tree.xpath("//tr"):
-        player_id = player_name = team_id = None
-
-        for a in row.xpath('.//a'):
-            href = str(a.get("href") or "")
-
-            pm = _PLAYER_LINK_RE.search(href)
-            if pm and player_id is None:
-                name = (a.text or "").strip() or a.text_content().strip()
-                if name and not name.isdigit():
-                    player_id = pm.group(1)
-                    player_name = name
-
-            tm = _TEAM_LINK_RE.search(href)
-            if tm and team_id is None:
-                team_id = tm.group(1)
-
-        if player_id and player_name and player_id not in seen:
-            seen.add(player_id)
-            players.append(
-                {
-                    "ncaa_player_id": player_id,
-                    "player_name": player_name,
-                    "stats_ncaa_team_id": team_id or "",
-                }
-            )
-
-    return players
-
-
-def _discover_players_via_ranking(
-    year: int,
-    division_id: int,
-    stat_seq: int,
-    ranking_period: int,
-) -> list[dict[str, str]]:
-    """Fetch the individual-player national ranking page and extract player records.
-
-    Uses ``stat_seq=271`` (individual batting average) by default, which lists
-    every qualifying batter in the division with both a player link and a team
-    link on each row.  The page is server-rendered, the same infrastructure as
-    the team-batting ranking page (stat_seq=281).
-    """
-    url = NATIONAL_RANKING_URL.format(
-        year=year,
-        division_id=division_id,
-        stat_seq=stat_seq,
-        ranking_period=ranking_period,
-    )
-    try:
-        html = fetch(url, namespace=f"ncaa_stats/player_rankings/{year}")
-        players = _parse_ranking_page_players(html)
-        sample = [p["player_name"] for p in players[:5]]
-        log.info(
-            "player ranking page year=%s: found %d players, sample=%s",
-            year,
-            len(players),
-            sample,
-        )
-        return players
-    except FetchError as e:
-        log.warning("player ranking page year=%s: %s", year, e)
-        return []
-
-
-def build_ncaa_player_map(
-    year: int,
-    division_id: int = 1,
-    *,
-    stat_seq: int = 271,
-    ranking_period: int | None = None,
-) -> pd.DataFrame:
-    """Build an ``{ncaa_player_id, player_name, stats_ncaa_team_id}`` table.
-
-    Uses the national individual-player ranking page (``stat_seq=271``,
-    individual batting average) which is server-rendered and lists every
-    qualifying batter in the division with both player and team links per row.
-
-    Requires ``ranking_period`` — the year-specific period ID from
-    ``WSB_D1_RANKING_PERIOD`` in config.py.  Returns an empty DataFrame if
-    ``ranking_period`` is None or the page is unavailable.
-    """
-    if ranking_period is None:
-        log.warning("player map: ranking_period not set for year %s — skipping", year)
-        return pd.DataFrame()
-
-    players = _discover_players_via_ranking(year, division_id, stat_seq, ranking_period)
-    if not players:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(players)
-    log.info("player map year=%s: %d unique players", year, len(df))
-    return df.reset_index(drop=True)
-
-
 # --- Discovery ---------------------------------------------------------------
 
 def _discover_via_contest(contest_id: str) -> dict[str, str]:
@@ -319,6 +204,5 @@ __all__ = [
     "INDIVIDUAL_STATS_URL",
     "NATIONAL_RANKING_URL",
     "ROSTER_URL",
-    "build_ncaa_player_map",
     "discover_team_season_ids",
 ]
