@@ -17,6 +17,7 @@ dependencies = [
     "typer>=0.12",
     "tenacity>=8.2",
     "platformdirs>=4.0",
+    "tqdm>=4.66",
 ]
 
 [project.optional-dependencies]

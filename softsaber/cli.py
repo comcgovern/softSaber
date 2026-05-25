@@ -180,7 +180,12 @@ def ingest_all(
     ] = None,
     verbose: bool = False,
 ) -> None:
-    """End-to-end ingest (scoreboard → teams → pbp → boxscore) for seasons or one day."""
+    """End-to-end ingest: scoreboard → teams → rosters → boxscore → pbp.
+
+    Rosters come before boxscore/pbp so name resolution can use the
+    authoritative stats.ncaa.org player list rather than the degraded
+    boxscore-derived names.
+    """
     _setup_logging(verbose)
     from . import storage
 
@@ -194,9 +199,11 @@ def ingest_all(
             typer.echo(f"no games found for {d.isoformat()}; stopping")
             return
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
-        teams_mod.build_teams_table(softball_ids, d.year)
-        pbp_mod.ingest_pbp_for_games(games, d.year, partition)
+        teams = teams_mod.build_teams_table(softball_ids, d.year)
+        teams = rosters_mod.discover_and_update_teams(teams, games, d.year)
+        rosters_mod.ingest_season_rosters(teams, games, d.year)
         boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
+        pbp_mod.ingest_pbp_for_games(games, d.year, partition)
         return
 
     years = seasons if seasons else list(TARGET_SEASONS)
@@ -205,9 +212,11 @@ def ingest_all(
         scoreboard_mod.ingest_season(sn)
         games = storage.read_table("games", partitions=[str(year)])
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
-        teams_mod.build_teams_table(softball_ids, year)
-        pbp_mod.ingest_season_pbp(games, year)
+        teams = teams_mod.build_teams_table(softball_ids, year)
+        teams = rosters_mod.discover_and_update_teams(teams, games, year)
+        rosters_mod.ingest_season_rosters(teams, games, year)
         boxscore_mod.ingest_boxscores_for_games(games, partition=str(year))
+        pbp_mod.ingest_season_pbp(games, year)
 
 
 @ingest_app.command("rosters")
@@ -274,13 +283,18 @@ def stats_wrc(
 
     from .parse.pa import resolve_batter_names
     game_players = storage.read_table("game_players", partitions=[str(s) for s in seasons])
-    if not game_players.empty:
-        pa = resolve_batter_names(pa, game_players)
-    else:
+    rosters = storage.read_table("rosters", partitions=[str(s) for s in seasons])
+    if game_players.empty and rosters.empty:
         typer.echo(
-            "warning: no game_players data — batter names will be raw PBP tokens. "
-            "Run `ingest boxscore` to enable name resolution.",
+            "warning: no game_players or rosters data — batter names will be raw PBP tokens. "
+            "Run `ingest boxscore` and `ingest rosters` to enable name resolution.",
             err=True,
+        )
+    else:
+        pa = resolve_batter_names(
+            pa,
+            game_players if not game_players.empty else pd.DataFrame(),
+            rosters=rosters if not rosters.empty else None,
         )
 
     re = compute_re_matrix(pa)

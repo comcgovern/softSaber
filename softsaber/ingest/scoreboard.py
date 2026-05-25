@@ -156,15 +156,16 @@ def ingest_season(season: Season) -> pd.DataFrame:
         raise KeyError(f"no scoreboard window configured for {season.year}")
     start, end = SEASON_WINDOWS[season.year]
 
+    from tqdm import tqdm
+    dates = list(_iter_dates(start, end))
     all_games: list[GameRow] = []
-    for d in _iter_dates(start, end):
+    for d in tqdm(dates, desc=f"scoreboard {season.year}", unit="day"):
         try:
             day_games = fetch_day(season, d)
         except Exception as e:  # noqa: BLE001 — keep ingesting other days
             log.warning("scoreboard %s failed: %s", d, e, exc_info=log.isEnabledFor(logging.DEBUG))
             continue
         all_games.extend(day_games)
-        log.info("scoreboard %s: %d games", d, len(day_games))
 
     return _write_games(all_games, season, str(season.year))
 

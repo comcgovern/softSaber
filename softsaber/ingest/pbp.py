@@ -33,10 +33,11 @@ from __future__ import annotations
 
 import logging
 import re
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Iterable
 
 import pandas as pd
+from tqdm import tqdm
 
 from .. import storage
 from ..config import HENRYGD_WORKERS
@@ -295,9 +296,15 @@ def ingest_pbp_for_games(
     """
     game_ids = games["game_id"].astype(str).tolist()
     log.info("pbp: fetching %d games with %d workers", len(game_ids), HENRYGD_WORKERS)
+    frames: list[pd.DataFrame] = []
     with ThreadPoolExecutor(max_workers=HENRYGD_WORKERS) as exe:
-        results = list(exe.map(fetch_game_pbp, game_ids))
-    frames = [df for df in results if not df.empty]
+        futures = {exe.submit(fetch_game_pbp, gid): gid for gid in game_ids}
+        for fut in tqdm(
+            as_completed(futures), total=len(futures), desc="pbp", unit="game"
+        ):
+            res = fut.result()
+            if not res.empty:
+                frames.append(res)
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if not df.empty:
         df = _attach_team_names(df, games)

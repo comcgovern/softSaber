@@ -332,68 +332,26 @@ def _probe_roster(team_season_id: str) -> dict[str, Any]:
     }
 
 
-def _probe_gamecenter(contest_id: str) -> dict[str, Any]:
-    """POST a GameCenter request to sdataprod with browser-minted cookies."""
-    from curl_cffi import requests as curl_requests
-
-    from .sdataprod import GAMECENTER_HASH, GAMECENTER_OP, SDATAPROD_URL
-
-    # Bootstrap on the matching game page so cookies are minted in-context.
-    _, _, cookies = fetch_page_html(f"https://{NCAA_HOST}/game/{contest_id}")
-
-    body = {
-        "operationName": GAMECENTER_OP,
-        "variables": {"contestId": str(contest_id), "staticTestEnv": None},
-        "extensions": {
-            "persistedQuery": {"version": 1, "sha256Hash": GAMECENTER_HASH},
-        },
-    }
-    sess = curl_requests.Session(impersonate="chrome124")
-    sess.headers.update({
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": f"https://{NCAA_HOST}",
-        "Referer": f"https://{NCAA_HOST}/game/{contest_id}",
-    })
-    resp = sess.post(SDATAPROD_URL, json=body, cookies=cookies, timeout=20)
-    return {
-        "status": resp.status_code,
-        "bytes": len(resp.content),
-        "text_head": resp.text[:500],
-    }
-
-
 def main(argv: list[str]) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
-    if len(argv) < 3:
+    if len(argv) < 3 or argv[1] != "probe-roster":
         print(
-            "usage:\n"
-            "  python -m softsaber.ingest.akamai_session probe-roster <statsNcaaTeamId>\n"
-            "  python -m softsaber.ingest.akamai_session probe-gamecenter <contestId>",
+            "usage: python -m softsaber.ingest.akamai_session probe-roster "
+            "<statsNcaaTeamId>",
             file=sys.stderr,
         )
         return 2
-    cmd, target = argv[1], argv[2]
-    if cmd == "probe-roster":
-        result = _probe_roster(target)
-        print(f"browser status:     {result['browser_status']}")
-        print(f"browser bytes:      {result['browser_bytes']}")
-        print(f"browser looks real: {result['browser_looks_real']}")
-        print(f"browser snippet (first 600 chars):")
-        print(result["browser_snippet"])
-        print()
-        print(f"curl_cffi status:   {result['curl_status']}")
-        print(f"curl_cffi bytes:    {result['curl_bytes']}")
-        print(f"curl_cffi snippet:  {result['curl_snippet'][:200]}")
-        return 0 if result["browser_looks_real"] else 1
-    if cmd == "probe-gamecenter":
-        result = _probe_gamecenter(target)
-        print(f"sdataprod status: {result['status']}")
-        print(f"sdataprod bytes:  {result['bytes']}")
-        print(f"response head:\n{result['text_head']}")
-        return 0 if result["status"] == 200 else 1
-    print(f"unknown command: {cmd}", file=sys.stderr)
-    return 2
+    result = _probe_roster(argv[2])
+    print(f"browser status:     {result['browser_status']}")
+    print(f"browser bytes:      {result['browser_bytes']}")
+    print(f"browser looks real: {result['browser_looks_real']}")
+    print("browser snippet (first 600 chars):")
+    print(result["browser_snippet"])
+    print()
+    print(f"curl_cffi status:   {result['curl_status']}")
+    print(f"curl_cffi bytes:    {result['curl_bytes']}")
+    print(f"curl_cffi snippet:  {result['curl_snippet'][:200]}")
+    return 0 if result["browser_looks_real"] else 1
 
 
 if __name__ == "__main__":

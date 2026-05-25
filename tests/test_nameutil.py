@@ -143,11 +143,11 @@ def test_resolve_batter_names_empty_game_players() -> None:
 
 
 def test_resolve_batter_names_degraded_boxscore_upgraded_by_rosters() -> None:
-    """Degraded boxscore name ("A. Lightner") resolves to full GameCenter name.
+    """Degraded boxscore name resolves to full stats.ncaa.org roster name.
 
     Simulates the production scenario:
     - game_players has the degraded first name ``"A."`` from the boxscore.
-    - rosters has the GameCenter-upgraded ``"Andrea"``.
+    - rosters has the proper ``"Andrea"`` from stats.ncaa.org.
     resolve_batter_names should pick the richer rosters row.
     """
     pbp = pd.DataFrame([
@@ -190,13 +190,13 @@ def test_resolve_batter_names_falls_back_to_game_players_when_rosters_miss() -> 
 
 
 def test_split_combined_name_repairs_empty_first() -> None:
-    from softsaber.ingest.rosters import _split_combined_name
-    assert _split_combined_name("", "Libby Pippin") == ("Libby", "Pippin")
-    assert _split_combined_name("", "Andrea Mae Lightner") == ("Andrea", "Mae Lightner")
+    from softsaber.ingest.boxscore import split_combined_name
+    assert split_combined_name("", "Libby Pippin") == ("Libby", "Pippin")
+    assert split_combined_name("", "Andrea Mae Lightner") == ("Andrea", "Mae Lightner")
     # Untouched when firstName is already populated
-    assert _split_combined_name("Libby", "Pippin") == ("Libby", "Pippin")
+    assert split_combined_name("Libby", "Pippin") == ("Libby", "Pippin")
     # Untouched when lastName has no whitespace
-    assert _split_combined_name("", "Pippin") == ("", "Pippin")
+    assert split_combined_name("", "Pippin") == ("", "Pippin")
 
 
 def test_resolve_batter_names_team_scoped() -> None:

@@ -23,10 +23,11 @@ that join use ``team_seoname`` ↔ ``softball_id`` in the teams table.
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 import pandas as pd
+from tqdm import tqdm
 
 from .. import storage
 from ..config import HENRYGD_WORKERS
@@ -53,6 +54,26 @@ def _safe_int(v: Any, default: int = 0) -> int:
         return int(v)
     except (TypeError, ValueError):
         return default
+
+
+def split_combined_name(first: str, last: str) -> tuple[str, str]:
+    """Repair the upstream bug where the full name lands in lastName.
+
+    Many softball boxscore entries arrive as ``firstName="" /
+    lastName="Libby Pippin"`` — the source didn't split.  When firstName
+    is empty and lastName contains whitespace, treat the first token as
+    the given name and the remainder as the surname.
+
+    Returns ``(first, last)`` unchanged when no repair applies.
+    Multi-token surnames (``"De La Cruz"``) come out wrong; the rosters
+    table from stats.ncaa.org is the authoritative source for those.
+    """
+    if first or " " not in last.strip():
+        return first, last
+    parts = last.strip().split()
+    if len(parts) < 2:
+        return first, last
+    return parts[0], " ".join(parts[1:])
 
 
 def parse_boxscore(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
@@ -87,13 +108,9 @@ def parse_boxscore(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
             if not p.get("participated"):
                 continue
 
-            first = _safe_str(p.get("firstName"))
-            last = _safe_str(p.get("lastName"))
-            # Repair upstream bug: firstName="" + full name in lastName.
-            if not first and " " in last:
-                parts = last.split()
-                if len(parts) >= 2:
-                    first, last = parts[0], " ".join(parts[1:])
+            first, last = split_combined_name(
+                _safe_str(p.get("firstName")), _safe_str(p.get("lastName"))
+            )
 
             bat = p.get("batterStats") or {}
             pit = p.get("pitcherStats") or {}
@@ -145,10 +162,16 @@ def ingest_boxscores_for_games(games: pd.DataFrame, partition: str | None = None
             return pd.DataFrame()
         return parse_boxscore(payload, gid)
 
+    frames: list[pd.DataFrame] = []
     with ThreadPoolExecutor(max_workers=HENRYGD_WORKERS) as exe:
-        results = list(exe.map(_fetch_and_parse, game_ids))
-    frames = [df for df in results if not df.empty]
-    fetched = sum(1 for df in results if not df.empty)
+        futures = {exe.submit(_fetch_and_parse, gid): gid for gid in game_ids}
+        for fut in tqdm(
+            as_completed(futures), total=len(futures), desc="boxscores", unit="game"
+        ):
+            df = fut.result()
+            if not df.empty:
+                frames.append(df)
+    fetched = len(frames)
 
     if frames and partition is not None:
         combined = pd.concat(frames, ignore_index=True)
