@@ -292,10 +292,21 @@ def stats_wrc(
     if pbp.empty:
         raise SystemExit("no pbp_raw partitions found — run `ingest pbp` first")
 
+    # Attribute the active pitcher to every PBP row before collapsing to
+    # PA, so per-pitcher rate stats downstream have a pitcher to group by.
+    game_players = storage.read_table("game_players", partitions=[str(s) for s in seasons])
+    if not game_players.empty:
+        from .parse.pitcher import attribute_pitchers
+        pbp = attribute_pitchers(pbp, game_players)
+    else:
+        typer.echo(
+            "warning: no game_players data — pitcher attribution skipped.",
+            err=True,
+        )
+
     pa = build_pa_table(pbp)
 
     from .parse.pa import resolve_batter_names
-    game_players = storage.read_table("game_players", partitions=[str(s) for s in seasons])
     rosters = storage.read_table("rosters", partitions=[str(s) for s in seasons])
     if game_players.empty and rosters.empty:
         typer.echo(
