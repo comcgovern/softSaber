@@ -157,6 +157,35 @@ def _do_get(sess: curl_requests.Session, url: str) -> str:
     return resp.text
 
 
+@retry(
+    reraise=True,
+    stop=stop_after_attempt(REQUEST_RETRY_MAX),
+    wait=wait_exponential(multiplier=REQUEST_RETRY_BASE_DELAY_S, min=2, max=30),
+    retry=retry_if_exception_type(
+        (
+            requests.ConnectionError,
+            requests.Timeout,
+            curl_requests.exceptions.RequestException,
+            FetchError,
+        )
+    ),
+    before_sleep=_log_retry,
+)
+def _do_post_json(sess: curl_requests.Session, url: str, body: dict) -> str:
+    resp = sess.post(
+        url,
+        json=body,
+        timeout=REQUEST_TIMEOUT_S,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    log.debug("POST %s → %d (%d bytes)", url, resp.status_code, len(resp.content))
+    if resp.status_code == 429 or 500 <= resp.status_code < 600:
+        raise FetchError(f"retryable status {resp.status_code} for {url}")
+    if resp.status_code != 200:
+        raise FetchError(f"status {resp.status_code} for {url}")
+    return resp.text
+
+
 def fetch(url: str, *, namespace: str, force: bool = False, ext: str = "html") -> str:
     """GET ``url`` with disk cache. ``namespace`` groups cached files by source.
 
@@ -181,4 +210,35 @@ def fetch(url: str, *, namespace: str, force: bool = False, ext: str = "html") -
         path.write_text(f"<!-- src: {url} -->\n{text}", encoding="utf-8")
     else:
         path.write_text(text, encoding="utf-8")
+    return text
+
+
+def post_json(
+    url: str,
+    body: dict,
+    *,
+    namespace: str,
+    force: bool = False,
+) -> str:
+    """POST ``body`` as JSON to ``url`` with disk cache keyed on URL+body.
+
+    Used for GraphQL persisted-query endpoints where the request body
+    (operationName + variables + extensions) is the cache key.
+    """
+    import json as _json
+
+    ensure_dirs()
+    body_blob = _json.dumps(body, sort_keys=True, separators=(",", ":"))
+    key = f"{url}\n{body_blob}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    path = RAW_DIR / namespace / f"{digest}.json"
+    if path.exists() and not force:
+        log.debug("cache hit POST %s", url)
+        return path.read_text(encoding="utf-8")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _rate_limiter.acquire()
+    log.info("POST %s body=%s", url, body_blob[:200])
+    text = _do_post_json(session(), url, body)
+    path.write_text(text, encoding="utf-8")
     return text
