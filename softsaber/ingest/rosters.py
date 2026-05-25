@@ -374,13 +374,53 @@ def ingest_season_rosters(
             log.warning("rosters year=%s: no player data from any source", year)
             return pd.DataFrame()
         combined = pd.concat(frames, ignore_index=True)
-        dedup_cols = ["last_name", "first_name", "team_seoname"]
+
+        # A player appears in many games' boxscores across a season; some
+        # appearances will have degraded names ("" or "A.") and others
+        # will be full ("Libby Pippin"). Pick one row per player keeping
+        # the best name we ever saw for them.
+        #
+        # Identity within a team is "same last_name + same jersey".  We
+        # also fall back to last_name alone for rows missing jersey, so
+        # a player who only ever appeared without a number doesn't get
+        # dropped.
+        def _name_quality(first: str) -> int:
+            if not first:
+                return 0
+            stripped = first.replace(".", "").strip()
+            if len(stripped) <= 1:
+                return 1  # "A.", "A"
+            return 2 + len(first)  # prefer longest full name
+
+        combined["_q"] = combined["first_name"].fillna("").map(_name_quality)
+        combined = combined.sort_values(
+            ["team_seoname", "last_name", "jersey", "_q"],
+            ascending=[True, True, True, False],
+        )
+        # Two-pass dedup: rows with a jersey collapse on (team, last, jersey);
+        # rows without a jersey (or jersey == -1) collapse on (team, last).
+        has_jersey = combined["jersey"].notna() & (combined["jersey"] != -1)
+        with_j = combined[has_jersey].drop_duplicates(
+            subset=["team_seoname", "last_name", "jersey"], keep="first"
+        )
+        without_j = combined[~has_jersey].drop_duplicates(
+            subset=["team_seoname", "last_name"], keep="first"
+        )
+        # If a (team, last) pair shows up in both groups, prefer the jerseyed one.
+        seen = set(zip(with_j["team_seoname"], with_j["last_name"]))
+        without_j = without_j[
+            ~without_j.apply(lambda r: (r["team_seoname"], r["last_name"]) in seen, axis=1)
+        ]
         combined = (
-            combined
-            .sort_values(["team_seoname", "last_name", "first_name", "jersey"])
-            .drop_duplicates(subset=dedup_cols, keep="first")
+            pd.concat([with_j, without_j], ignore_index=True)
+            .drop(columns=["_q"])
             .reset_index(drop=True)
         )
+        # Recompute player_name in case the surviving row had a stale value
+        # (e.g., it came in before _split_combined_name updated the parts).
+        combined["player_name"] = (
+            combined["first_name"].fillna("") + " " + combined["last_name"].fillna("")
+        ).str.strip()
         if "team_seoname" in teams.columns and "team_name" in teams.columns:
             seo_to_name = teams.set_index("team_seoname")["team_name"].to_dict()
             mask = combined["team_name"].eq("") | combined["team_name"].isna()
