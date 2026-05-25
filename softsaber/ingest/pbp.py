@@ -264,7 +264,15 @@ def _attach_team_names(pbp: pd.DataFrame, games: pd.DataFrame) -> pd.DataFrame:
         return pbp
     cols = ["away_team", "home_team", "away_team_id", "home_team_id"]
     available = [c for c in cols if c in games.columns]
-    names = games.set_index("game_id")[available].to_dict("index")
+    # A game can appear on multiple scoreboard dates (postponed + makeup,
+    # or doubleheader entries sharing one upstream id), so dedup before
+    # building the lookup.  Last occurrence wins, which prefers the
+    # makeup-date row over the original.
+    names = (
+        games.drop_duplicates(subset=["game_id"], keep="last")
+        .set_index("game_id")[available]
+        .to_dict("index")
+    )
     bt: list[str] = []
     ft: list[str] = []
     for r in pbp.itertuples(index=False):
@@ -305,7 +313,10 @@ def ingest_pbp_for_games(
             res = fut.result()
             if not res.empty:
                 frames.append(res)
-    df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    df = (
+        pd.concat([f for f in frames if not f.empty], ignore_index=True)
+        if frames else pd.DataFrame()
+    )
     if not df.empty:
         df = _attach_team_names(df, games)
         df["season"] = season
