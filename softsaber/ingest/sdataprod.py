@@ -39,7 +39,7 @@ SDATAPROD_URL = "https://sdataprod.ncaa.com/"
 # this you'll see ``PersistedQueryNotFound`` GraphQL errors; refresh by
 # inspecting the network traffic on ncaa.com/game/<id>.
 GAMECENTER_HASH = (
-    "93a02c7193c89d85bcdda8c1784925d9b64657f73ef584382e2297af555acd4b"
+    "26d14df5714c5cd454c9032a1f8ebb1b1dc35173065ab858709b0fa84dd07b5f"
 )
 GAMECENTER_OP = "GetGamecenterGameById_web"
 
