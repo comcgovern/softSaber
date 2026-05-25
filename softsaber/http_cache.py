@@ -131,6 +131,17 @@ def _cache_path(url: str, namespace: str, ext: str = "html") -> Path:
     return RAW_DIR / namespace / f"{digest}.{ext}"
 
 
+_RETRYABLE_STATUSES = {429, 503}  # 502/504 are usually upstream-down: retrying in seconds rarely helps.
+
+
+def _classify_status(status: int, url: str) -> None:
+    if status == 200:
+        return
+    if status in _RETRYABLE_STATUSES:
+        raise FetchError(f"retryable status {status} for {url}")
+    raise PermanentFetchError(f"status {status} for {url}")
+
+
 _RETRYABLE_TYPES = (
     requests.ConnectionError,
     requests.Timeout,
@@ -168,10 +179,7 @@ def _log_retry(retry_state) -> None:  # type: ignore[type-arg]
 def _do_get(sess: curl_requests.Session, url: str) -> str:
     resp = sess.get(url, timeout=REQUEST_TIMEOUT_S)
     log.debug("GET %s → %d (%d bytes)", url, resp.status_code, len(resp.content))
-    if resp.status_code == 429 or 500 <= resp.status_code < 600:
-        raise FetchError(f"retryable status {resp.status_code} for {url}")
-    if resp.status_code != 200:
-        raise PermanentFetchError(f"status {resp.status_code} for {url}")
+    _classify_status(resp.status_code, url)
     return resp.text
 
 
@@ -190,10 +198,7 @@ def _do_post_json(sess: curl_requests.Session, url: str, body: dict) -> str:
         headers={"Content-Type": "application/json", "Accept": "application/json"},
     )
     log.debug("POST %s → %d (%d bytes)", url, resp.status_code, len(resp.content))
-    if resp.status_code == 429 or 500 <= resp.status_code < 600:
-        raise FetchError(f"retryable status {resp.status_code} for {url}")
-    if resp.status_code != 200:
-        raise PermanentFetchError(f"status {resp.status_code} for {url}")
+    _classify_status(resp.status_code, url)
     return resp.text
 
 
