@@ -29,9 +29,20 @@ import json
 import logging
 from typing import Any
 
-from ..http_cache import FetchError, post_json
+from ..http_cache import FetchError, PermanentFetchError, post_json
 
 log = logging.getLogger(__name__)
+
+# Circuit breaker: once sdataprod returns a permanent 403 (Akamai block)
+# the rest of this process should stop trying — every additional call
+# burns a rate-limit slot and won't recover within the run.  Reset by
+# restarting the process or calling _reset_circuit() in tests.
+_BLOCKED = False
+
+
+def _reset_circuit() -> None:
+    global _BLOCKED
+    _BLOCKED = False
 
 SDATAPROD_URL = "https://sdataprod.ncaa.com/"
 
@@ -62,6 +73,10 @@ def fetch_gamecenter(contest_id: str, *, force: bool = False) -> dict[str, Any] 
     NCAA rotated the hash).  Callers should treat that as "no enrichment
     available" and proceed with the boxscore data.
     """
+    global _BLOCKED
+    if _BLOCKED:
+        return None
+
     body = _apollo_body(
         GAMECENTER_OP,
         GAMECENTER_HASH,
@@ -71,6 +86,16 @@ def fetch_gamecenter(contest_id: str, *, force: bool = False) -> dict[str, Any] 
         text = post_json(
             SDATAPROD_URL, body, namespace="sdataprod/gamecenter", force=force
         )
+    except PermanentFetchError as e:
+        # 4xx — almost certainly Akamai blocking us.  Trip the breaker so
+        # we don't retry this for every remaining game in the run.
+        _BLOCKED = True
+        log.warning(
+            "gamecenter %s blocked by sdataprod (%s); "
+            "disabling GameCenter enrichment for this run",
+            contest_id, e,
+        )
+        return None
     except FetchError as e:
         log.debug("gamecenter %s unreachable: %s", contest_id, e)
         return None

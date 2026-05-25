@@ -31,7 +31,7 @@ import requests
 from curl_cffi import requests as curl_requests
 from tenacity import (
     retry,
-    retry_if_exception_type,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
 )
@@ -50,7 +50,15 @@ log = logging.getLogger(__name__)
 
 
 class FetchError(RuntimeError):
-    pass
+    """HTTP failure.  Retryable by default (timeout, 429, 5xx)."""
+
+
+class PermanentFetchError(FetchError):
+    """Non-retryable HTTP failure (4xx other than 429).
+
+    Subclasses FetchError so existing ``except FetchError`` handlers
+    still catch it; tenacity skips it via an explicit predicate.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +131,23 @@ def _cache_path(url: str, namespace: str, ext: str = "html") -> Path:
     return RAW_DIR / namespace / f"{digest}.{ext}"
 
 
+_RETRYABLE_TYPES = (
+    requests.ConnectionError,
+    requests.Timeout,
+    curl_requests.exceptions.RequestException,
+)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """tenacity predicate: retry on network errors and retryable FetchError,
+    but NOT on PermanentFetchError (4xx other than 429)."""
+    if isinstance(exc, PermanentFetchError):
+        return False
+    if isinstance(exc, FetchError):
+        return True
+    return isinstance(exc, _RETRYABLE_TYPES)
+
+
 def _log_retry(retry_state) -> None:  # type: ignore[type-arg]
     log.debug(
         "retry %d/%d for %s after: %s",
@@ -137,14 +162,7 @@ def _log_retry(retry_state) -> None:  # type: ignore[type-arg]
     reraise=True,
     stop=stop_after_attempt(REQUEST_RETRY_MAX),
     wait=wait_exponential(multiplier=REQUEST_RETRY_BASE_DELAY_S, min=2, max=30),
-    retry=retry_if_exception_type(
-        (
-            requests.ConnectionError,
-            requests.Timeout,
-            curl_requests.exceptions.RequestException,
-            FetchError,
-        )
-    ),
+    retry=retry_if_exception(_is_retryable),
     before_sleep=_log_retry,
 )
 def _do_get(sess: curl_requests.Session, url: str) -> str:
@@ -153,7 +171,7 @@ def _do_get(sess: curl_requests.Session, url: str) -> str:
     if resp.status_code == 429 or 500 <= resp.status_code < 600:
         raise FetchError(f"retryable status {resp.status_code} for {url}")
     if resp.status_code != 200:
-        raise FetchError(f"status {resp.status_code} for {url}")
+        raise PermanentFetchError(f"status {resp.status_code} for {url}")
     return resp.text
 
 
@@ -161,14 +179,7 @@ def _do_get(sess: curl_requests.Session, url: str) -> str:
     reraise=True,
     stop=stop_after_attempt(REQUEST_RETRY_MAX),
     wait=wait_exponential(multiplier=REQUEST_RETRY_BASE_DELAY_S, min=2, max=30),
-    retry=retry_if_exception_type(
-        (
-            requests.ConnectionError,
-            requests.Timeout,
-            curl_requests.exceptions.RequestException,
-            FetchError,
-        )
-    ),
+    retry=retry_if_exception(_is_retryable),
     before_sleep=_log_retry,
 )
 def _do_post_json(sess: curl_requests.Session, url: str, body: dict) -> str:
@@ -182,7 +193,7 @@ def _do_post_json(sess: curl_requests.Session, url: str, body: dict) -> str:
     if resp.status_code == 429 or 500 <= resp.status_code < 600:
         raise FetchError(f"retryable status {resp.status_code} for {url}")
     if resp.status_code != 200:
-        raise FetchError(f"status {resp.status_code} for {url}")
+        raise PermanentFetchError(f"status {resp.status_code} for {url}")
     return resp.text
 
 
