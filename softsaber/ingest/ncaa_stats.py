@@ -126,7 +126,10 @@ def _parse_roster_html(html: str, team_season_id: str) -> pd.DataFrame:
 
     Two-pass approach:
     1. ``pd.read_html`` for the tabular data.
-    2. lxml scan for ``/players/{id}`` hrefs (``read_html`` discards links).
+    2. lxml scan over the *roster table's rows specifically* for
+       ``/players/{id}`` hrefs.  Scoping to the table avoids picking up
+       links from sidebars (team leaders, season bests) that would make
+       the link count exceed the row count.
     """
     import io
 
@@ -151,20 +154,41 @@ def _parse_roster_html(html: str, team_season_id: str) -> pd.DataFrame:
     df = df.rename(columns={k: v for k, v in rename.items() if k in df.columns})
     df["team_season_id"] = team_season_id
 
+    # Find the roster table in the DOM (largest <table> by row count, same
+    # heuristic pd.read_html effectively uses) and pull one player link per
+    # row.  A row with no link gets None — typically a coach/staff entry
+    # or a player whose page doesn't exist yet.
     player_ids: list[str | None] = []
     try:
         tree = lxml_html.fromstring(html)
-        for a in tree.xpath('//a[contains(@href, "/players/")]'):
-            m = _PLAYER_LINK_RE.search(str(a.get("href") or ""))
-            if m:
-                player_ids.append(m.group(1))
-    except Exception:
-        pass
+        tables_dom = tree.xpath("//table")
+        if tables_dom:
+            roster_table = max(tables_dom, key=lambda t: len(t.xpath(".//tr")))
+            for tr in roster_table.xpath(".//tr"):
+                # Skip header rows (they have <th> not <td>).
+                if not tr.xpath(".//td"):
+                    continue
+                pid: str | None = None
+                for a in tr.xpath('.//a[contains(@href, "/players/")]'):
+                    m = _PLAYER_LINK_RE.search(str(a.get("href") or ""))
+                    if m:
+                        pid = m.group(1)
+                        break
+                player_ids.append(pid)
+    except Exception as e:  # noqa: BLE001
+        log.debug("team %s: link extraction failed: %s", team_season_id, e)
 
     if len(player_ids) == len(df):
         df["ncaa_player_id"] = player_ids
+        unlinked = sum(1 for p in player_ids if p is None)
+        if unlinked:
+            log.debug(
+                "team %s: %d/%d players have no /players/ link "
+                "(coach, redshirt, or page not yet published)",
+                team_season_id, unlinked, len(df),
+            )
     elif player_ids:
-        log.debug(
+        log.warning(
             "team %s: %d player links vs %d table rows — skipping ID join",
             team_season_id, len(player_ids), len(df),
         )
