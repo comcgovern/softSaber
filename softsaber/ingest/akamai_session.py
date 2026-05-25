@@ -187,6 +187,80 @@ def fetch_page_html(url: str) -> tuple[int, str, dict[str, str]]:
             browser.close()
 
 
+class BrowserSession:
+    """Long-lived headless Chrome context for fetching multiple Akamai-
+    protected pages without re-paying the challenge each time.
+
+    Use as a context manager::
+
+        with BrowserSession() as sess:
+            html1 = sess.get('https://stats.ncaa.org/teams/613592/roster')
+            html2 = sess.get('https://stats.ncaa.org/teams/613593/roster')
+
+    The first ``get`` pays the JS-challenge cost (~3–5s).  Subsequent
+    fetches in the same session reuse the warm Akamai state and finish
+    in roughly the time of the navigation itself.
+    """
+
+    def __init__(self, *, use_real_chrome: bool = True) -> None:
+        self._use_real_chrome = use_real_chrome
+        self._pw = None
+        self._browser = None
+        self._context = None
+        self._page = None
+
+    def __enter__(self) -> "BrowserSession":
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError as e:
+            raise RuntimeError(
+                "playwright is not installed. Run:\n"
+                "    pip install -e .[akamai]\n"
+                "    playwright install chromium"
+            ) from e
+        self._pw = sync_playwright().start()
+        self._browser, self._context = _new_browser(
+            self._pw, use_real_chrome=self._use_real_chrome
+        )
+        self._page = self._context.new_page()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        try:
+            if self._browser is not None:
+                self._browser.close()
+        finally:
+            if self._pw is not None:
+                self._pw.stop()
+            self._browser = self._context = self._page = self._pw = None
+
+    def get(self, url: str, *, settle_min_bytes: int = 10_000) -> tuple[int, str]:
+        """Navigate ``page`` to ``url`` and return (status, html) once the
+        Akamai challenge has cleared.  Returns whatever HTML is loaded
+        after a 20-second clearance timeout if the challenge stalls.
+        """
+        if self._page is None:
+            raise RuntimeError("BrowserSession used outside its context manager")
+        try:
+            resp = self._page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            status = resp.status if resp else 0
+        except Exception as e:  # noqa: BLE001
+            log.warning("page.goto(%s) raised (%s); reading current state", url, e)
+            status = 0
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            body = self._page.content()
+            if (
+                len(body) > settle_min_bytes
+                and 'meta http-equiv="refresh"' not in body.lower()
+            ):
+                break
+            self._page.wait_for_timeout(500)
+        html = self._page.content()
+        log.info("akamai: %s → %d bytes (final url %s)", url, len(html), self._page.url)
+        return status, html
+
+
 def get_cookies(host: str, *, force_refresh: bool = False) -> dict[str, str]:
     """Return Akamai cookies for ``host``, minting via browser if needed.
 

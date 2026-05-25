@@ -172,18 +172,28 @@ def _parse_roster_html(html: str, team_season_id: str) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _looks_like_challenge(html: str | None) -> bool:
+    if not html:
+        return True
+    if len(html) < _ROSTER_CHALLENGE_BYTE_LIMIT:
+        return True
+    return 'meta http-equiv="refresh"' in html.lower()
+
+
 def fetch_team_roster(
     team_season_id: str,
     year: int,
     *,
     force: bool = False,
+    browser_session: object = None,
 ) -> pd.DataFrame:
     """Fetch and parse the roster for one team-season.
 
-    Akamai bot-detection may serve a short challenge page on the first request.
-    We detect this (response < ``_ROSTER_CHALLENGE_BYTE_LIMIT`` bytes) and
-    retry once; the second request includes the session cookies set by the
-    challenge, which is often sufficient to get the real page.
+    Akamai bot-detection serves a JS challenge page to ``curl_cffi``.  If
+    a ``browser_session`` (a ``softsaber.ingest.akamai_session.BrowserSession``)
+    is provided, we use it as the fallback when ``curl_cffi`` returns the
+    challenge — real Chrome clears the challenge and gives us the real page.
+    Without a browser session, we just return empty on challenge responses.
     """
     url = ROSTER_URL.format(team_season_id=team_season_id)
     ns = f"ncaa_stats/rosters/{year}"
@@ -199,18 +209,27 @@ def fetch_team_roster(
             return None
 
     html = _attempt(force)
-    if html is None:
-        return pd.DataFrame()
 
-    # If response looks like an Akamai challenge page, retry once.
-    if len(html) < _ROSTER_CHALLENGE_BYTE_LIMIT:
+    if _looks_like_challenge(html) and browser_session is not None:
         log.debug(
-            "roster team_season_id=%s: short response (%d bytes), retrying for real page",
-            team_season_id, len(html),
+            "roster team_season_id=%s: curl_cffi got challenge page, falling back to browser",
+            team_season_id,
         )
-        html2 = _attempt(force_flag=True)
-        if html2 and len(html2) > len(html):
-            html = html2
+        try:
+            _, html = browser_session.get(url)
+            # Cache the cleared page so repeat runs don't pay the browser cost.
+            if html and not _looks_like_challenge(html):
+                from ..http_cache import _cache_path  # type: ignore[attr-defined]
+                from ..config import ensure_dirs
+                ensure_dirs()
+                path = _cache_path(url, ns, ext="html")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"<!-- src: {url} -->\n{html}", encoding="utf-8")
+        except Exception as e:  # noqa: BLE001
+            log.warning("roster team_season_id=%s: browser fetch failed: %s", team_season_id, e)
+
+    if html is None or _looks_like_challenge(html):
+        return pd.DataFrame()
 
     df = _parse_roster_html(html, team_season_id)
     log.info("roster team_season_id=%s: %d players", team_season_id, len(df))

@@ -316,10 +316,16 @@ def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
 def _try_ncaa_rosters(teams: pd.DataFrame, year: int) -> pd.DataFrame:
     """Attempt to fetch rosters from stats.ncaa.org/teams/{id}/roster.
 
-    Returns a combined DataFrame, or empty if the WAF blocks all requests.
-    The Akamai challenge page is ~2 KB; fetch_team_roster retries once after
-    the first request sets session cookies, which often bypasses the block.
-    Requires ``stats_ncaa_team_id`` to be populated in ``teams``.
+    First pass tries ``curl_cffi`` (works only if Akamai isn't challenging
+    us, which is rare).  When that returns the challenge page, we open a
+    single ``BrowserSession`` (headless real Chrome via Playwright) and
+    drive it serially across the remaining teams — the JS challenge is
+    only paid on the first navigation; subsequent fetches reuse the
+    cleared session.
+
+    Returns a combined DataFrame, or empty if the browser isn't installed
+    and curl_cffi alone can't reach the pages.  Requires
+    ``stats_ncaa_team_id`` to be populated in ``teams``.
     """
     eligible = teams[teams["stats_ncaa_team_id"].notna()].copy()
     if eligible.empty:
@@ -327,9 +333,9 @@ def _try_ncaa_rosters(teams: pd.DataFrame, year: int) -> pd.DataFrame:
 
     log.info("rosters: trying stats.ncaa.org for %d teams", len(eligible))
 
-    def _fetch(row) -> pd.DataFrame:  # type: ignore[type-arg]
+    def _fetch(row, browser_session=None) -> pd.DataFrame:  # type: ignore[type-arg]
         tid = str(row.stats_ncaa_team_id)
-        df = ncaa_stats.fetch_team_roster(tid, year)
+        df = ncaa_stats.fetch_team_roster(tid, year, browser_session=browser_session)
         if df.empty:
             return df
         df["team_name"] = row.team_name
@@ -337,10 +343,42 @@ def _try_ncaa_rosters(teams: pd.DataFrame, year: int) -> pd.DataFrame:
         df["season"] = year
         return df
 
+    # Pass 1: curl_cffi only, in parallel.  Fast for the (rare) case where
+    # Akamai isn't currently challenging.
     with ThreadPoolExecutor(max_workers=NCAA_STATS_WORKERS) as exe:
-        results = list(exe.map(_fetch, eligible.itertuples(index=False)))
+        first_pass = list(exe.map(lambda r: _fetch(r), eligible.itertuples(index=False)))
 
-    frames = [df for df in results if not df.empty]
+    frames = [df for df in first_pass if not df.empty]
+    missing = [
+        row for row, df in zip(eligible.itertuples(index=False), first_pass) if df.empty
+    ]
+    if not missing:
+        return pd.concat(frames, ignore_index=True)
+
+    # Pass 2: browser-driven, serial.  Skipped silently if Playwright
+    # isn't installed — the henrygd fallback will pick up the slack.
+    try:
+        from .akamai_session import BrowserSession
+    except Exception as e:  # noqa: BLE001
+        log.info(
+            "rosters: %d teams unresolved by curl_cffi; browser fallback unavailable (%s)",
+            len(missing), e,
+        )
+        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+    log.info(
+        "rosters: %d teams unresolved by curl_cffi; opening headless Chrome to retry",
+        len(missing),
+    )
+    try:
+        with BrowserSession() as bs:
+            for row in missing:
+                df = _fetch(row, browser_session=bs)
+                if not df.empty:
+                    frames.append(df)
+    except RuntimeError as e:
+        # Playwright not installed, or no Chrome available.
+        log.warning("rosters: browser fallback unusable (%s)", e)
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
