@@ -28,9 +28,18 @@ log = logging.getLogger(__name__)
 TEAM_CODES_URL = "https://stats.ncaa.org/game_upload/team_codes"
 
 
-def fetch_team_codes(force: bool = False) -> pd.DataFrame:
+def fetch_team_codes(force: bool = False, browser_session: object = None) -> pd.DataFrame:
     """Return a DataFrame of (team_id, team_name) for every NCAA institution."""
-    raw = fetch(TEAM_CODES_URL, namespace="team_codes", force=force)
+    from .akamai_session import fetch_or_browser
+
+    raw = fetch_or_browser(
+        TEAM_CODES_URL,
+        namespace="team_codes",
+        browser_session=browser_session,
+        force=force,
+    )
+    if not raw:
+        raise RuntimeError(f"team_codes unreachable ({TEAM_CODES_URL})")
     # First HTML table on the page has the codes.
     tables = pd.read_html(io.StringIO(raw))
     if not tables:
@@ -44,13 +53,18 @@ def fetch_team_codes(force: bool = False) -> pd.DataFrame:
     return df.drop_duplicates(subset=["team_id"]).reset_index(drop=True)
 
 
-def build_teams_table(season_softball_ids: pd.DataFrame, season: int) -> pd.DataFrame:
+def build_teams_table(
+    season_softball_ids: pd.DataFrame,
+    season: int,
+    *,
+    browser_session: object = None,
+) -> pd.DataFrame:
     """Join team-code list to softball-side IDs gathered from the scoreboard.
 
     ``season_softball_ids`` must have columns ``team_name`` and ``softball_id``;
     produced by :func:`softsaber.ingest.scoreboard.discover_team_softball_ids`.
     """
-    codes = fetch_team_codes()
+    codes = fetch_team_codes(browser_session=browser_session)
     merged = (
         season_softball_ids.merge(codes, on="team_name", how="left")
         .assign(season=season)

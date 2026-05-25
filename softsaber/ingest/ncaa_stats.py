@@ -213,45 +213,19 @@ def fetch_team_roster(
 ) -> pd.DataFrame:
     """Fetch and parse the roster for one team-season.
 
-    Akamai bot-detection serves a JS challenge page to ``curl_cffi``.  If
-    a ``browser_session`` (a ``softsaber.ingest.akamai_session.BrowserSession``)
-    is provided, we use it as the fallback when ``curl_cffi`` returns the
-    challenge — real Chrome clears the challenge and gives us the real page.
-    Without a browser session, we just return empty on challenge responses.
+    Akamai bot-detection serves a JS challenge page to ``curl_cffi``; when
+    a ``browser_session`` is provided, ``fetch_or_browser`` falls back to
+    real Chrome and caches the cleared HTML for future runs.
     """
+    from .akamai_session import fetch_or_browser
+
     url = ROSTER_URL.format(team_season_id=team_season_id)
-    ns = f"ncaa_stats/rosters/{year}"
-
-    def _attempt(force_flag: bool) -> str | None:
-        try:
-            return fetch(url, namespace=ns, force=force_flag)
-        except FetchError as e:
-            log.warning("roster team_season_id=%s: %s", team_season_id, e)
-            return None
-        except Exception as e:  # noqa: BLE001
-            log.warning("roster team_season_id=%s: unexpected error: %s", team_season_id, e)
-            return None
-
-    html = _attempt(force)
-
-    if _looks_like_challenge(html) and browser_session is not None:
-        log.debug(
-            "roster team_season_id=%s: curl_cffi got challenge page, falling back to browser",
-            team_season_id,
-        )
-        try:
-            _, html = browser_session.get(url)
-            # Cache the cleared page so repeat runs don't pay the browser cost.
-            if html and not _looks_like_challenge(html):
-                from ..http_cache import _cache_path  # type: ignore[attr-defined]
-                from ..config import ensure_dirs
-                ensure_dirs()
-                path = _cache_path(url, ns, ext="html")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"<!-- src: {url} -->\n{html}", encoding="utf-8")
-        except Exception as e:  # noqa: BLE001
-            log.warning("roster team_season_id=%s: browser fetch failed: %s", team_season_id, e)
-
+    html = fetch_or_browser(
+        url,
+        namespace=f"ncaa_stats/rosters/{year}",
+        browser_session=browser_session,
+        force=force,
+    )
     if html is None or _looks_like_challenge(html):
         return pd.DataFrame()
 
@@ -262,46 +236,49 @@ def fetch_team_roster(
 
 # --- Discovery ---------------------------------------------------------------
 
-def _discover_via_contest(contest_id: str) -> dict[str, str]:
+def _discover_via_contest(contest_id: str, browser_session=None) -> dict[str, str]:
     """Fetch one game's stats page and extract team links.
 
     Returns an empty dict (not an error) when the page is unavailable — the
     caller should continue with the next contest_id.
     """
+    from .akamai_session import fetch_or_browser
+
     url = CONTEST_STATS_URL.format(contest_id=contest_id)
-    try:
-        html = fetch(url, namespace="ncaa_stats/contests")
-        found = _parse_team_links(html)
-        if found:
-            log.debug("contest %s: found %d team links", contest_id, len(found))
-        return found
-    except FetchError as e:
-        log.debug("contest %s: skipped (%s)", contest_id, e)
+    html = fetch_or_browser(
+        url, namespace="ncaa_stats/contests", browser_session=browser_session
+    )
+    if not html:
         return {}
-    except Exception as e:  # noqa: BLE001
-        log.warning("contest %s: unexpected error: %s", contest_id, e)
-        return {}
+    found = _parse_team_links(html)
+    if found:
+        log.debug("contest %s: found %d team links", contest_id, len(found))
+    return found
 
 
 def _discover_via_ranking(
-    year: int, division_id: int, stat_seq: int, ranking_period: int
+    year: int, division_id: int, stat_seq: int, ranking_period: int,
+    *, browser_session=None,
 ) -> dict[str, str]:
     """Fetch the national ranking page and extract all team links in one shot."""
+    from .akamai_session import fetch_or_browser
+
     url = NATIONAL_RANKING_URL.format(
         year=year,
         division_id=division_id,
         stat_seq=stat_seq,
         ranking_period=ranking_period,
     )
-    try:
-        html = fetch(url, namespace=f"ncaa_stats/rankings/{year}")
-        found = _parse_team_links(html)
-        sample = list(found.keys())[:10]
-        log.info("ranking page year=%s: found %d team links, sample=%s", year, len(found), sample)
-        return found
-    except FetchError as e:
-        log.warning("ranking page year=%s: %s", year, e)
+    html = fetch_or_browser(
+        url, namespace=f"ncaa_stats/rankings/{year}", browser_session=browser_session
+    )
+    if not html:
+        log.warning("ranking page year=%s: unreachable", year)
         return {}
+    found = _parse_team_links(html)
+    sample = list(found.keys())[:10]
+    log.info("ranking page year=%s: found %d team links, sample=%s", year, len(found), sample)
+    return found
 
 
 def discover_team_season_ids(
@@ -312,6 +289,7 @@ def discover_team_season_ids(
     stat_seq: int | None = None,
     ranking_period: int | None = None,
     max_contests: int = 30,
+    browser_session=None,
 ) -> dict[str, str]:
     """Build a ``{team_name: stats_ncaa_team_id}`` mapping for one season.
 
@@ -335,16 +313,25 @@ def discover_team_season_ids(
     """
     results: dict[str, str] = {}
 
-    # Path 1: per-game pages (no extra config needed).
+    # Path 1: per-game pages.  Browser fetches must be serial (one
+    # context, one tab), but most contest pages are cached from prior
+    # runs; the threadpool stays useful for cache hits.
     if contest_ids:
         batch = [str(c) for c in contest_ids[:max_contests]]
-        with ThreadPoolExecutor(max_workers=NCAA_STATS_WORKERS) as exe:
-            for found in exe.map(_discover_via_contest, batch):
-                results.update(found)
+        if browser_session is None:
+            with ThreadPoolExecutor(max_workers=NCAA_STATS_WORKERS) as exe:
+                for found in exe.map(_discover_via_contest, batch):
+                    results.update(found)
+        else:
+            for contest_id in batch:
+                results.update(_discover_via_contest(contest_id, browser_session))
 
     # Path 2: national rankings page (covers 100 % of teams in one fetch).
     if stat_seq is not None and ranking_period is not None:
-        results.update(_discover_via_ranking(year, division_id, stat_seq, ranking_period))
+        results.update(_discover_via_ranking(
+            year, division_id, stat_seq, ranking_period,
+            browser_session=browser_session,
+        ))
 
     log.info(
         "discover_team_season_ids year=%s: found %d teams total", year, len(results)

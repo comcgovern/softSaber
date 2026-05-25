@@ -189,34 +189,47 @@ def ingest_all(
     _setup_logging(verbose)
     from . import storage
 
-    if day:
-        d = _parse_date(day)
-        sn = Season(d.year, division)
-        partition = _date_partition(d.year, d)
-        scoreboard_mod.ingest_date(sn, d)
-        games = storage.read_table("games", partitions=[partition])
-        if games.empty:
-            typer.echo(f"no games found for {d.isoformat()}; stopping")
-            return
-        softball_ids = scoreboard_mod.discover_team_softball_ids(games)
-        teams = teams_mod.build_teams_table(softball_ids, d.year)
-        teams = rosters_mod.discover_and_update_teams(teams, games, d.year)
-        rosters_mod.ingest_season_rosters(teams, games, d.year)
-        boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
-        pbp_mod.ingest_pbp_for_games(games, d.year, partition)
-        return
+    # One BrowserSession across all stats.ncaa.org calls in this run:
+    # team-codes, contest discovery, ranking discovery, and roster fetches.
+    # The JS challenge is paid once at the first navigation; everything
+    # else reuses the cleared Akamai state.
+    try:
+        from .ingest.akamai_session import BrowserSession
+        bs_cm = BrowserSession()
+    except ImportError:
+        bs_cm = None
 
-    years = seasons if seasons else list(TARGET_SEASONS)
-    for year in years:
-        sn = Season(year, division)
-        scoreboard_mod.ingest_season(sn)
-        games = storage.read_table("games", partitions=[str(year)])
+    def _run_year(year: int, games: pd.DataFrame, partition: str, bs) -> None:
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
-        teams = teams_mod.build_teams_table(softball_ids, year)
-        teams = rosters_mod.discover_and_update_teams(teams, games, year)
-        rosters_mod.ingest_season_rosters(teams, games, year)
-        boxscore_mod.ingest_boxscores_for_games(games, partition=str(year))
-        pbp_mod.ingest_season_pbp(games, year)
+        teams = teams_mod.build_teams_table(softball_ids, year, browser_session=bs)
+        teams = rosters_mod.discover_and_update_teams(teams, games, year, browser_session=bs)
+        rosters_mod.ingest_season_rosters(teams, games, year, browser_session=bs)
+        boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
+        pbp_mod.ingest_pbp_for_games(games, year, partition)
+
+    bs = bs_cm.__enter__() if bs_cm is not None else None
+    try:
+        if day:
+            d = _parse_date(day)
+            sn = Season(d.year, division)
+            partition = _date_partition(d.year, d)
+            scoreboard_mod.ingest_date(sn, d)
+            games = storage.read_table("games", partitions=[partition])
+            if games.empty:
+                typer.echo(f"no games found for {d.isoformat()}; stopping")
+                return
+            _run_year(d.year, games, partition, bs)
+            return
+
+        years = seasons if seasons else list(TARGET_SEASONS)
+        for year in years:
+            sn = Season(year, division)
+            scoreboard_mod.ingest_season(sn)
+            games = storage.read_table("games", partitions=[str(year)])
+            _run_year(year, games, str(year), bs)
+    finally:
+        if bs_cm is not None:
+            bs_cm.__exit__(None, None, None)
 
 
 @ingest_app.command("rosters")

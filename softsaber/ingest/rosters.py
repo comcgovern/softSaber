@@ -71,6 +71,8 @@ def discover_and_update_teams(
     teams: pd.DataFrame,
     games: pd.DataFrame,
     year: int,
+    *,
+    browser_session: object = None,
 ) -> pd.DataFrame:
     """Discover ``stats_ncaa_team_id`` for each team and write an updated teams table.
 
@@ -89,6 +91,7 @@ def discover_and_update_teams(
         contest_ids=contest_ids,
         stat_seq=WSB_D1_RANKING_STAT_SEQ,
         ranking_period=ranking_period,
+        browser_session=browser_session,
     )
 
     teams = teams.copy()
@@ -123,6 +126,8 @@ def ingest_season_rosters(
     teams: pd.DataFrame,
     games: pd.DataFrame,
     year: int,
+    *,
+    browser_session: object = None,
 ) -> pd.DataFrame:
     """Fetch one roster page per team from stats.ncaa.org via Playwright.
 
@@ -145,22 +150,11 @@ def ingest_season_rosters(
                     "run `ingest teams` and `ingest rosters` discovery first", year)
         return pd.DataFrame()
 
-    try:
-        from .akamai_session import BrowserSession
-    except ImportError as e:
-        log.error(
-            "rosters year=%s: Playwright not installed (%s). Run:\n"
-            "    pip install -e .[akamai]\n"
-            "    playwright install chromium",
-            year, e,
-        )
-        return pd.DataFrame()
-
     frames: list[pd.DataFrame] = []
     rows = list(eligible.itertuples(index=False))
     has_seo = "team_seoname" in eligible.columns
 
-    with BrowserSession() as bs:
+    def _drive(bs) -> None:
         for row in tqdm(rows, desc=f"rosters {year}", unit="team"):
             tid = str(row.stats_ncaa_team_id)
             df = ncaa_stats.fetch_team_roster(tid, year, browser_session=bs)
@@ -172,6 +166,22 @@ def ingest_season_rosters(
                 df["team_seoname"] = getattr(row, "team_seoname", "")
             df["season"] = year
             frames.append(df)
+
+    if browser_session is not None:
+        _drive(browser_session)
+    else:
+        try:
+            from .akamai_session import BrowserSession
+        except ImportError as e:
+            log.error(
+                "rosters year=%s: Playwright not installed (%s). Run:\n"
+                "    pip install -e .[akamai]\n"
+                "    playwright install chromium",
+                year, e,
+            )
+            return pd.DataFrame()
+        with BrowserSession() as bs:
+            _drive(bs)
 
     if not frames:
         log.warning("rosters year=%s: no rosters fetched", year)

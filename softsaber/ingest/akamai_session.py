@@ -261,6 +261,66 @@ class BrowserSession:
         return status, html
 
 
+def fetch_or_browser(
+    url: str,
+    *,
+    namespace: str,
+    browser_session: "BrowserSession | None" = None,
+    force: bool = False,
+    challenge_threshold_bytes: int = 8_000,
+) -> str | None:
+    """Try ``curl_cffi`` first; fall back to ``browser_session`` on a
+    challenge/error.  Returns the cleared HTML (and writes it to the
+    standard http_cache path so subsequent runs hit the disk cache).
+
+    Returns ``None`` when both paths fail.  This is the canonical helper
+    for any stats.ncaa.org endpoint — discovery, rosters, team_codes.
+    """
+    from ..http_cache import FetchError, _cache_path, fetch  # type: ignore[attr-defined]
+    from ..config import ensure_dirs
+
+    def _is_challenge(html: str | None) -> bool:
+        if not html:
+            return True
+        if len(html) < challenge_threshold_bytes:
+            return True
+        return 'meta http-equiv="refresh"' in html.lower()
+
+    try:
+        html = fetch(url, namespace=namespace, force=force)
+    except FetchError as e:
+        log.debug("fetch_or_browser %s: curl_cffi failed (%s)", url, e)
+        html = None
+    except Exception as e:  # noqa: BLE001
+        log.warning("fetch_or_browser %s: unexpected curl_cffi error: %s", url, e)
+        html = None
+
+    if not _is_challenge(html):
+        return html
+
+    if browser_session is None:
+        log.warning(
+            "fetch_or_browser %s: challenge response and no browser_session available",
+            url,
+        )
+        return html  # may be the challenge page; caller can decide
+
+    try:
+        _, html = browser_session.get(url)
+    except Exception as e:  # noqa: BLE001
+        log.warning("fetch_or_browser %s: browser fetch failed: %s", url, e)
+        return None
+
+    if html and not _is_challenge(html):
+        ensure_dirs()
+        path = _cache_path(url, namespace, ext="html")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"<!-- src: {url} -->\n{html}", encoding="utf-8")
+        return html
+
+    return html
+
+
 def get_cookies(host: str, *, force_refresh: bool = False) -> dict[str, str]:
     """Return Akamai cookies for ``host``, minting via browser if needed.
 
