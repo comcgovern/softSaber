@@ -189,6 +189,16 @@ def test_resolve_batter_names_falls_back_to_game_players_when_rosters_miss() -> 
     assert resolved["batter"].iloc[0] == "Shelby Knight"
 
 
+def test_split_combined_name_repairs_empty_first() -> None:
+    from softsaber.ingest.rosters import _split_combined_name
+    assert _split_combined_name("", "Libby Pippin") == ("Libby", "Pippin")
+    assert _split_combined_name("", "Andrea Mae Lightner") == ("Andrea", "Mae Lightner")
+    # Untouched when firstName is already populated
+    assert _split_combined_name("Libby", "Pippin") == ("Libby", "Pippin")
+    # Untouched when lastName has no whitespace
+    assert _split_combined_name("", "Pippin") == ("", "Pippin")
+
+
 def test_resolve_batter_names_team_scoped() -> None:
     """Players from game_players are filtered to batting_team_id first."""
     pbp = pd.DataFrame([

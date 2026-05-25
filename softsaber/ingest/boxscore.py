@@ -89,6 +89,11 @@ def parse_boxscore(payload: dict[str, Any], game_id: str) -> pd.DataFrame:
 
             first = _safe_str(p.get("firstName"))
             last = _safe_str(p.get("lastName"))
+            # Repair upstream bug: firstName="" + full name in lastName.
+            if not first and " " in last:
+                parts = last.split()
+                if len(parts) >= 2:
+                    first, last = parts[0], " ".join(parts[1:])
 
             bat = p.get("batterStats") or {}
             pit = p.get("pitcherStats") or {}

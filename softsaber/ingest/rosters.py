@@ -144,6 +144,31 @@ def _is_degraded_first_name(first: str) -> bool:
     return len(stripped) <= 1
 
 
+def _split_combined_name(first: str, last: str) -> tuple[str, str]:
+    """Repair the common upstream bug where the full name lands in lastName.
+
+    Many softball boxscores arrive as ``firstName="" / lastName="Libby Pippin"``
+    — the source didn't split the name at all.  When firstName is empty and
+    lastName contains whitespace, treat the first whitespace-separated token
+    as the given name and the remainder as the surname.
+
+    Returns ``(first, last)`` unchanged if no repair applies.  Returns
+    ``(first, last)`` with the split applied if firstName is empty and
+    lastName has whitespace.
+
+    Multi-token surnames (e.g. ``"De La Cruz"``) are still wrong after this
+    repair — we choose the more common single-token-first-name case over
+    perfect handling of compound surnames, since the GameCenter upgrade
+    path is meant to fix the ambiguous cases.
+    """
+    if first or " " not in last.strip():
+        return first, last
+    parts = last.strip().split()
+    if len(parts) < 2:
+        return first, last
+    return parts[0], " ".join(parts[1:])
+
+
 def _gamecenter_name_index(payload: dict) -> dict[tuple[str, str, str], str]:
     """Walk a GameCenter payload and build a name-upgrade lookup.
 
@@ -256,9 +281,14 @@ def _boxscore_to_player_rows(game_id: str) -> pd.DataFrame:
                 continue
             jersey = p.get("number")
 
-            # ~12% of softball boxscore entries are degraded ("A.", "").
-            # When that happens, lazily fetch the richer GameCenter payload
-            # for this contest and use it to upgrade the first name.
+            # Repair the most common upstream degradation locally first:
+            # firstName="" with the full name in lastName ("Libby Pippin").
+            first, last = _split_combined_name(first, last)
+
+            # If the firstName is still degraded ("", "A.") and the
+            # GameCenter endpoint is reachable, upgrade via sdataprod.
+            # (Akamai usually 403s this; the circuit breaker keeps us
+            # from hammering once that's confirmed.)
             if last and _is_degraded_first_name(first):
                 if gc_index is None:
                     gc_payload = sdataprod.fetch_gamecenter(game_id)
