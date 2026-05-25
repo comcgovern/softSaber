@@ -146,13 +146,31 @@ def fetch_page_html(url: str) -> tuple[int, str, dict[str, str]]:
         browser, context = _new_browser(pw)
         try:
             page = context.new_page()
-            resp = page.goto(url, wait_until="networkidle", timeout=60_000)
-            status = resp.status if resp else 0
+            # domcontentloaded fires as soon as the HTML parses — much
+            # faster than networkidle, which never settles while the
+            # Akamai sensor is pinging.  We do the real wait below by
+            # polling for either the cleared _abck cookie or the URL
+            # changing away from the challenge page.
+            try:
+                resp = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                status = resp.status if resp else 0
+            except Exception as e:  # noqa: BLE001
+                log.warning("page.goto raised (%s); reading whatever we have", e)
+                status = 0
 
-            # Give the JS challenge a chance to complete before we read.
-            _wait_for_clearance(context, host)
+            # Wait for the challenge to clear.  The challenge page is
+            # small (~300B-3KB) and contains a meta-refresh; the real
+            # page is much larger.  Poll until either the body grows
+            # past a sane threshold or we time out.
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                body = page.content()
+                if len(body) > 10_000 and "meta http-equiv=\"refresh\"" not in body.lower():
+                    break
+                page.wait_for_timeout(500)
 
             html = page.content()
+            log.info("akamai: final URL = %s, body = %d bytes", page.url, len(html))
             cookies = {
                 c["name"]: c["value"]
                 for c in context.cookies()
