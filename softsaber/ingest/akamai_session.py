@@ -79,8 +79,26 @@ def _looks_valid_abck(value: str) -> bool:
     return len(value) > 400
 
 
-def _new_browser(pw):  # type: ignore[no-untyped-def]
-    browser = pw.chromium.launch(headless=True)
+def _new_browser(pw, *, use_real_chrome: bool = True):  # type: ignore[no-untyped-def]
+    """Launch a browser.  ``use_real_chrome`` drives the user's installed
+    Chrome instead of Playwright's bundled Chromium — Akamai often static-
+    blocks bundled Chromium based on binary/fingerprint tells but lets
+    real Chrome through.  Falls back to Chromium if Chrome isn't installed.
+    """
+    launch_kwargs: dict[str, Any] = {"headless": True}
+    if use_real_chrome:
+        launch_kwargs["channel"] = "chrome"
+    try:
+        browser = pw.chromium.launch(**launch_kwargs)
+    except Exception as e:  # noqa: BLE001
+        if use_real_chrome:
+            log.warning(
+                "real Chrome not available (%s); falling back to bundled Chromium",
+                e,
+            )
+            browser = pw.chromium.launch(headless=True)
+        else:
+            raise
     context = browser.new_context(
         user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
