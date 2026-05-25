@@ -70,9 +70,14 @@ def build_teams_table(
         .assign(season=season)
         .loc[:, ["season", "team_name", "team_id", "softball_id"]]
     )
-    missing = merged["team_id"].isna().sum()
-    if missing:
-        log.warning("season %s: %d teams missing NCAA team_id (name mismatch)", season, missing)
+    missing_mask = merged["team_id"].isna()
+    n_missing = int(missing_mask.sum())
+    if n_missing:
+        missing_names = sorted(merged.loc[missing_mask, "team_name"].dropna().unique().tolist())
+        log.warning(
+            "season %s: %d teams missing NCAA team_id (name mismatch): %s",
+            season, n_missing, missing_names,
+        )
     storage.write_partition("teams", str(season), merged)
     return merged
 
