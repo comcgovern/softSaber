@@ -55,16 +55,19 @@ REQUEST_RETRY_BASE_DELAY_S = 2.0
 #   stats.ncaa.org — Akamai-fronted; curl_cffi handles TLS fingerprinting.
 #   The site itself is fast; the bottleneck is the WAF, not throughput.
 
-# henrygd / ncaa-api: be a polite guest on a public API.
-HENRYGD_RATE_PER_SEC: float = 2.0
-HENRYGD_WORKERS: int = 2
+# henrygd / ncaa-api: the public instance documents 5 req/s per IP.  We
+# run at 4 to leave a little headroom for retries and other clients on
+# the same egress, and 4 workers so the parallel ingest can actually
+# saturate the budget instead of being thread-bound.
+HENRYGD_RATE_PER_SEC: float = 4.0
+HENRYGD_WORKERS: int = 4
 
 # stats.ncaa.org scraping (team discovery, roster pages).
 NCAA_STATS_RATE_PER_SEC: float = 3.0
 NCAA_STATS_WORKERS: int = 3
 
 # Shared fallback used by older code paths and http_cache's _RateLimiter.
-# Set to the more conservative of the two so a single limiter is safe for both.
+# Set to the henrygd budget since that's what runs through it.
 REQUEST_RATE_PER_SEC: float = HENRYGD_RATE_PER_SEC
 REQUEST_WORKERS: int = HENRYGD_WORKERS
 
