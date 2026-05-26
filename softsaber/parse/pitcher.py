@@ -30,28 +30,66 @@ log = logging.getLogger(__name__)
 # should come first so a longer match wins.
 #
 # Anchored against the *start* of the event text (after stripping
-# leading whitespace) to avoid matching mid-narration "X relieved Y"
-# fragments inside an at-bat description.
+# leading whitespace) to avoid matching mid-narration fragments inside
+# an at-bat description.
 _PITCHER_CHANGE_PATTERNS: list[re.Pattern[str]] = [
-    # "Pitching: SMITH, J. for JONES, B."
-    re.compile(r"^\s*Pitching(?:\s+change)?\s*:\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)", re.I),
-    # "SMITH, J. to p[itcher] for JONES, B."
-    re.compile(r"^\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)\s+to\s+p(?:itcher)?\b", re.I),
+    # Team-code prefix: "ND pitching change: Weiss,Brianne"
+    # The team code is 2-5 uppercase letters (ND, GCU, FURM, DUKE, ARIZ, ...).
+    re.compile(
+        r"^\s*[A-Z]{2,5}\s+pitching\s+change\s*:\s*"
+        r"(?P<name>[A-Z][\w'\-]+(?:,\s*[\w'\-]+(?:\s+[\w'\-]+)?)?)\b",
+        re.I,
+    ),
+    # "Pitching: SMITH, J. for JONES, B." or "Pitching change: SMITH, J."
+    re.compile(
+        r"^\s*Pitching(?:\s+change)?\s*:\s*"
+        r"(?P<name>[A-Z][\w'\-]+(?:,\s*[\w'\-]+(?:\s+[\w'\-]+)?)?)",
+        re.I,
+    ),
     # "Now pitching: SMITH, J."
-    re.compile(r"^\s*Now\s+pitching\s*:\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)", re.I),
-    # "SMITH, J. relieved JONES, B."
-    re.compile(r"^\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)\s+relieved\b", re.I),
-    # "SMITH, J. in to pitch for JONES, B."
-    re.compile(r"^\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)\s+in(?:to)?\s+to\s+pitch\b", re.I),
+    re.compile(
+        r"^\s*Now\s+pitching\s*:\s*"
+        r"(?P<name>[A-Z][\w'\-]+(?:,\s*[\w'\-]+(?:\s+[\w'\-]+)?)?)",
+        re.I,
+    ),
     # "P: SMITH, J."
     re.compile(r"^\s*P\s*:\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)", re.I),
+    # "SMITH, J. to p[itcher] for JONES, B." or "SMITH, J. to p."
+    # LASTNAME, FI form — anchored to start so at-bat text like
+    # "X grounded out to p" never matches.
+    re.compile(
+        r"^\s*(?P<name>[A-Z][\w'\-]+,\s*[A-Z]\.?)\s+to\s+p(?:itcher)?\b",
+        re.I,
+    ),
+    # "Firstname Lastname to p[itcher] for X" / "Firstname Lastname to p."
+    # Title-case first + last, then " to p" — same start-anchor protects
+    # us from picking up "Player Name grounded out to p" because
+    # "grounded" isn't part of the name capture.
+    re.compile(
+        r"^\s*(?P<name>[A-Z][a-z]+(?:[\s'\-][A-Z][a-z]+)+)\s+to\s+p(?:itcher)?\b",
+        re.I,
+    ),
+    # "SMITH, J. relieved JONES, B."
+    re.compile(
+        r"^\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)\s+relieved\b", re.I
+    ),
+    # "SMITH, J. in to pitch for JONES, B."
+    re.compile(
+        r"^\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?)\s+in(?:to)?\s+to\s+pitch\b",
+        re.I,
+    ),
 ]
 
-# Cheap "looks like a substitution / boilerplate row" detector.  Used to
-# log unmatched substitution lines so we can add patterns later.
-_SUB_HINT_RE = re.compile(
-    r"\b(?:pitching|pitcher|pinch|substitution|sub for|to p\b|in to (?:pitch|p)|"
-    r"defensive change|now p\b)",
+# Detector for lines that *specifically* look like pitching changes.
+# Non-pitching subs (pinch-run, pinch-hit, defensive change) won't
+# match.  At-bat narration is filtered out separately by checking
+# events.classify before reaching this regex, so "X grounded out to p"
+# and "X singled to pitcher" never reach the unmatched log.
+_PITCHER_SUB_HINT_RE = re.compile(
+    r"(?:^\s*(?:[A-Z]{2,5}\s+)?pitching\s+change\b)|"
+    r"(?:^\s*now\s+pitching\b)|"
+    r"(?:^\s*p\s*:)|"
+    r"(?:\bto\s+p(?:itcher)?\s*(?:\.|for\b|$))",
     re.I,
 )
 
@@ -140,6 +178,7 @@ def attribute_pitchers(
 
     # Pull a stable lookup for resolving substitution name tokens
     # ("SMITH, J.") to a real player row, scoped by (game_id, team_id).
+    from .events import classify
     from .nameutil import match_player
     gp_by_game_team: dict[tuple[str, str], pd.DataFrame] = {}
     if not game_players.empty:
@@ -193,8 +232,17 @@ def attribute_pitchers(
         events = str(getattr(r, "events", "") or "") if has_ev else ""
 
         # Pitching change handling — must run before stamping so the new
-        # pitcher takes effect from this row forward.
-        incoming = parse_pitcher_change(events) if events else None
+        # pitcher takes effect from this row forward.  Only consider
+        # rows that aren't real PA events; classify() returns an outcome
+        # for at-bat rows ("X grounded out to p" → GO), so we skip them
+        # entirely and avoid both false-positive matches and noisy logs.
+        incoming: str | None = None
+        is_at_bat = False
+        if events:
+            is_at_bat = classify(events).outcome is not None
+            if not is_at_bat:
+                incoming = parse_pitcher_change(events)
+
         if incoming and f_tid:
             players = gp_by_game_team.get((gid, f_tid))
             if players is not None and not players.empty:
@@ -212,12 +260,14 @@ def attribute_pitchers(
                     state[f_tid] = {"name": incoming, "player_id": None}
             else:
                 state[f_tid] = {"name": incoming, "player_id": None}
-        elif events and _SUB_HINT_RE.search(events) and not events.startswith(("Pitching:", "P:")):
-            # Substitution-shaped line our patterns didn't catch; count it
-            # so we know whether to add more patterns later.
+        elif (
+            events and not is_at_bat and _PITCHER_SUB_HINT_RE.search(events)
+        ):
+            # Looks pitching-specific but didn't match any pattern — log
+            # so we can iterate on patterns later.
             unmatched_subs += 1
             if log.isEnabledFor(logging.DEBUG):
-                log.debug("unmatched substitution line: %s", events[:120])
+                log.debug("unmatched pitching-change line: %s", events[:120])
 
         active = state.get(f_tid, {}) if f_tid else {}
         pitchers.append(active.get("name") or None)

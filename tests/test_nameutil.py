@@ -82,6 +82,22 @@ def test_match_player_no_match() -> None:
     assert match_player("JONES, A", players) is None
 
 
+def test_match_player_full_first_with_comma() -> None:
+    """Team-code pitching-change format: 'Lastname,Firstname'."""
+    players = _make_players(("Brianne", "Weiss", True), ("Amy", "Adams", False))
+    hit = match_player("Weiss,Brianne", players)
+    assert hit is not None
+    assert hit["player_name"] == "Brianne Weiss"
+
+
+def test_match_player_firstname_lastname_order() -> None:
+    """Free-text feed format: 'Firstname Lastname' with no comma."""
+    players = _make_players(("Julia", "Pike", True), ("Sarah", "Wall", False))
+    hit = match_player("Julia Pike", players)
+    assert hit is not None
+    assert hit["player_name"] == "Julia Pike"
+
+
 def test_match_player_empty_df() -> None:
     assert match_player("KNIGHT, S", pd.DataFrame()) is None
 

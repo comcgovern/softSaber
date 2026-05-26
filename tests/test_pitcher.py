@@ -21,6 +21,32 @@ def test_parse_pitcher_change_ignores_at_bat_text() -> None:
     assert parse_pitcher_change("") is None
 
 
+def test_parse_pitcher_change_team_prefix() -> None:
+    """Team-code prefix format: 'ND pitching change: Weiss,Brianne'."""
+    assert parse_pitcher_change("ND pitching change: Weiss,Brianne") == "Weiss,Brianne"
+    assert parse_pitcher_change("GCU pitching change: Jones,Abi") == "Jones,Abi"
+    assert parse_pitcher_change("ARIZ pitching change: Holder,Rylie") == "Holder,Rylie"
+
+
+def test_parse_pitcher_change_firstname_lastname() -> None:
+    """Free-text format: 'Julia Pike to p.' or 'Cassie Brown to p for X'."""
+    assert parse_pitcher_change("Julia Pike to p.") == "Julia Pike"
+    assert parse_pitcher_change("Hailey Errichiello to p for Julia Smith.") == "Hailey Errichiello"
+    assert parse_pitcher_change("Tori Grifone to p for Alyssa Twome.") == "Tori Grifone"
+
+
+def test_parse_pitcher_change_doesnt_match_at_bat_outcomes() -> None:
+    """At-bat lines containing 'to p' or 'pitcher' should NOT match."""
+    # "X grounded out to p" — outcome verb between name and "to p"
+    assert parse_pitcher_change("Julia Rowley grounded out to p") is None
+    assert parse_pitcher_change("Ava Beal grounded out to p (0-1 K).") is None
+    # "singled to pitcher" is a hit destination, not a sub
+    assert parse_pitcher_change("Cate Lehner singled to pitcher, RBI.") is None
+    # pinch-running / pinch-hitting are subs but not pitching
+    assert parse_pitcher_change("Charlotte Constantine pinch ran for X.") is None
+    assert parse_pitcher_change("Sami Levine pinch hit for Akira") is None
+
+
 def test_attribute_pitchers_seeds_from_starters_and_follows_changes() -> None:
     # Game g1: away team 11 bats top, home team 22 bats bottom.
     # Away starter: ALPHA, A. (id A1)
