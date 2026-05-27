@@ -170,18 +170,22 @@ def ingest_season_rosters(
     if browser_session is not None:
         _drive(browser_session)
     else:
+        # BrowserSession defers the Playwright import to __enter__, so a
+        # missing-Playwright environment can surface as either ImportError
+        # (no akamai_session module) or RuntimeError (playwright not
+        # installed) — catch both and bail with an actionable message.
         try:
             from .akamai_session import BrowserSession
-        except ImportError as e:
+            with BrowserSession() as bs:
+                _drive(bs)
+        except (ImportError, RuntimeError) as e:
             log.error(
-                "rosters year=%s: Playwright not installed (%s). Run:\n"
+                "rosters year=%s: browser fallback unavailable (%s). Run:\n"
                 "    pip install -e .[akamai]\n"
                 "    playwright install chromium",
                 year, e,
             )
             return pd.DataFrame()
-        with BrowserSession() as bs:
-            _drive(bs)
 
     if not frames:
         log.warning("rosters year=%s: no rosters fetched", year)

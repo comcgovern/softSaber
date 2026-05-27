@@ -192,12 +192,24 @@ def ingest_all(
     # One BrowserSession across all stats.ncaa.org calls in this run:
     # team-codes, contest discovery, ranking discovery, and roster fetches.
     # The JS challenge is paid once at the first navigation; everything
-    # else reuses the cleared Akamai state.
+    # else reuses the cleared Akamai state.  BrowserSession defers the
+    # Playwright import to __enter__, so a missing-Playwright environment
+    # surfaces as RuntimeError there rather than ImportError on the import
+    # of akamai_session — catch both, degrade to curl_cffi-only.
+    bs_cm = None
+    bs = None
     try:
         from .ingest.akamai_session import BrowserSession
         bs_cm = BrowserSession()
-    except ImportError:
-        bs_cm = None
+        bs = bs_cm.__enter__()
+    except (ImportError, RuntimeError) as e:
+        if bs_cm is not None:
+            bs_cm = None
+        typer.echo(
+            f"warning: browser fallback unavailable ({e}); "
+            "stats.ncaa.org endpoints behind Akamai will be skipped.",
+            err=True,
+        )
 
     def _run_year(year: int, games: pd.DataFrame, partition: str, bs) -> None:
         softball_ids = scoreboard_mod.discover_team_softball_ids(games)
@@ -207,7 +219,6 @@ def ingest_all(
         boxscore_mod.ingest_boxscores_for_games(games, partition=partition)
         pbp_mod.ingest_pbp_for_games(games, year, partition)
 
-    bs = bs_cm.__enter__() if bs_cm is not None else None
     try:
         if day:
             d = _parse_date(day)

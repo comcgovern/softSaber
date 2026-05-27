@@ -205,9 +205,32 @@ def attribute_pitchers(
         for (gid, tid), grp in game_players.groupby(["game_id", "team_id"]):
             gp_by_game_team[(str(gid), str(tid))] = grp.reset_index(drop=True)
 
-    pbp = pbp_raw.copy().sort_values(["game_id", "row_idx"]).reset_index(drop=True)
+    pbp = pbp_raw.sort_values(["game_id", "row_idx"]).reset_index(drop=True)
     has_tb = "top_bottom" in pbp.columns
     has_ev = "events" in pbp.columns
+
+    # Pre-compute away/home team IDs for each game in a single pass so
+    # the per-row loop never has to filter the full table.  Walks all
+    # rows once, recording the first non-empty batting_team_id we see
+    # in each top/bottom half-inning per game.
+    away_home_by_game: dict[str, tuple[str, str]] = {}
+    if "batting_team_id" in pbp.columns and has_tb:
+        seen_per_game: dict[str, dict[str, str]] = {}
+        gids = pbp["game_id"].astype(str).to_numpy()
+        tbs = pbp["top_bottom"].astype(str).str.lower().to_numpy()
+        btids = pbp["batting_team_id"].astype(str).to_numpy()
+        for gid, tb, btid in zip(gids, tbs, btids):
+            if not gid or not btid:
+                continue
+            game = seen_per_game.setdefault(gid, {})
+            if tb in ("top", "bottom") and tb not in game:
+                game[tb] = btid
+                if "top" in game and "bottom" in game:
+                    away_home_by_game[gid] = (game["top"], game["bottom"])
+        # Games that only had one half-inning observed still get a partial entry.
+        for gid, halves in seen_per_game.items():
+            if gid not in away_home_by_game:
+                away_home_by_game[gid] = (halves.get("top", ""), halves.get("bottom", ""))
 
     pitchers: list[str | None] = []
     pitcher_ids: list[str | None] = []
@@ -222,21 +245,7 @@ def attribute_pitchers(
         gid = str(getattr(r, "game_id", "") or "")
         if gid != cur_game:
             cur_game = gid
-            # Infer away/home team ids for this game.  PBP carries
-            # batting_team_id; map it via top_bottom to get the pair.
-            game_rows = pbp[pbp["game_id"].astype(str) == gid]
-            tb_to_tid: dict[str, str] = {}
-            if "batting_team_id" in game_rows.columns and has_tb:
-                for tb in ("top", "bottom"):
-                    sub = game_rows[
-                        game_rows["top_bottom"].astype(str).str.lower() == tb
-                    ]
-                    tid_vals = sub["batting_team_id"].astype(str)
-                    tid_vals = tid_vals[tid_vals != ""]
-                    if not tid_vals.empty:
-                        tb_to_tid[tb] = tid_vals.iloc[0]
-            away_id = tb_to_tid.get("top", "")
-            home_id = tb_to_tid.get("bottom", "")
+            away_id, home_id = away_home_by_game.get(gid, ("", ""))
             # Seed the pitcher state from the boxscore starters.
             state = {}
             if away_id:
@@ -252,16 +261,20 @@ def attribute_pitchers(
         events = str(getattr(r, "events", "") or "") if has_ev else ""
 
         # Pitching change handling — must run before stamping so the new
-        # pitcher takes effect from this row forward.  Only consider
-        # rows that aren't real PA events; classify() returns an outcome
-        # for at-bat rows ("X grounded out to p" → GO), so we skip them
-        # entirely and avoid both false-positive matches and noisy logs.
+        # pitcher takes effect from this row forward.  ~99% of rows are
+        # at-bat events that don't match the pitching-change hint regex;
+        # only call the more expensive classify() to confirm an at-bat
+        # when we need to distinguish "real PA" from "unmatched sub".
         incoming: str | None = None
         is_at_bat = False
-        if events:
-            is_at_bat = classify(events).outcome is not None
-            if not is_at_bat:
-                incoming = parse_pitcher_change(events)
+        looks_pitching = bool(events) and bool(_PITCHER_SUB_HINT_RE.search(events))
+        if looks_pitching:
+            incoming = parse_pitcher_change(events)
+            if incoming is None:
+                # Only at this point is classify() worth running — we need
+                # to know whether the unmatched line is at-bat narration
+                # ("X singled to pitcher") or a sub we should log.
+                is_at_bat = classify(events).outcome is not None
 
         if incoming and f_tid:
             players = gp_by_game_team.get((gid, f_tid))
