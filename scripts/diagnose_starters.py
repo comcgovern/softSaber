@@ -9,11 +9,13 @@ import sys
 
 import pandas as pd
 
+from softsaber.parse.pitcher import _is_starting_pitcher_position
+
 
 def main(year: str) -> int:
     gp = pd.read_parquet(f"data/processed/game_players/{year}.parquet")
     starters_p = gp[
-        (gp["position"].astype(str).str.upper() == "P")
+        gp["position"].apply(_is_starting_pitcher_position)
         & gp["starter"].fillna(False)
     ]
 
