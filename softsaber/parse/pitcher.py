@@ -113,6 +113,26 @@ def parse_pitcher_change(text: str) -> str | None:
     return None
 
 
+def _is_starting_pitcher_position(pos: str) -> bool:
+    """A player is a starting pitcher when the first slot in their
+    position string is ``P``.
+
+    NCAA boxscores list two-way players with slash-separated positions:
+
+    * ``p``          → pure pitcher
+    * ``p/dp``       → started at pitcher, also designated player
+    * ``p/3b``       → started at pitcher, moved to 3B later
+    * ``dp/p``       → started as DP, came in to pitch later  → NOT starter
+    * ``1b/p``       → started at 1B, moved to pitch later     → NOT starter
+
+    We accept the first form group and reject the rest.
+    """
+    if not pos:
+        return False
+    first = str(pos).strip().upper().split("/")[0].strip()
+    return first == "P"
+
+
 def _starting_pitchers(game_players: pd.DataFrame) -> dict[tuple[str, str], dict]:
     """Return ``{(game_id, team_id): {"name": str, "player_id": str|None}}``
     for the starter at position P on each team in each game.
@@ -123,8 +143,8 @@ def _starting_pitchers(game_players: pd.DataFrame) -> dict[tuple[str, str], dict
     if game_players.empty or "position" not in game_players.columns:
         return {}
     starters = game_players[
-        (game_players["position"].astype(str).str.upper() == "P")
-        & (game_players["starter"].fillna(False).astype(bool))
+        game_players["position"].apply(_is_starting_pitcher_position)
+        & game_players["starter"].fillna(False).astype(bool)
     ]
     out: dict[tuple[str, str], dict] = {}
     for (gid, tid), grp in starters.groupby(["game_id", "team_id"]):

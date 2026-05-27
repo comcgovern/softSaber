@@ -91,6 +91,21 @@ def test_attribute_pitchers_seeds_from_starters_and_follows_changes() -> None:
     assert result.iloc[3]["pitcher_id"] == "C1"
 
 
+def test_starting_pitcher_position_accepts_p_first() -> None:
+    from softsaber.parse.pitcher import _is_starting_pitcher_position
+    assert _is_starting_pitcher_position("p")
+    assert _is_starting_pitcher_position("P")
+    assert _is_starting_pitcher_position("p/dp")
+    assert _is_starting_pitcher_position("p/3b")
+    assert _is_starting_pitcher_position("P/RF")
+    # Player who came in to pitch later — not a starter at P:
+    assert not _is_starting_pitcher_position("dp/p")
+    assert not _is_starting_pitcher_position("1b/p")
+    assert not _is_starting_pitcher_position("ph/p")
+    assert not _is_starting_pitcher_position("c")
+    assert not _is_starting_pitcher_position("")
+
+
 def test_attribute_pitchers_handles_empty() -> None:
     pbp = pd.DataFrame()
     game_players = pd.DataFrame()
