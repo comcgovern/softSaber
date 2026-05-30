@@ -123,6 +123,29 @@ def ingest_teams(
     typer.echo(f"teams written: {len(df)}")
 
 
+@ingest_app.command("discover-team-ids")
+def ingest_discover_team_ids(
+    seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
+    verbose: bool = False,
+) -> None:
+    """Re-run only the stats.ncaa.org team-ID discovery step (no roster scrape).
+
+    Cheap when contest pages are already cached — lets you iterate on the
+    name-matching logic without re-fetching ~350 roster pages.  Updates
+    ``teams/{season}.parquet`` with a fresh ``stats_ncaa_team_id`` column.
+    """
+    from . import storage
+
+    _setup_logging(verbose)
+    for year in seasons:
+        games = storage.read_table("games", partitions=[str(year)])
+        teams = storage.read_table("teams", partitions=[str(year)])
+        if teams.empty:
+            typer.echo(f"season {year}: no teams partition — run `ingest teams` first")
+            continue
+        rosters_mod.discover_and_update_teams(teams, games, year)
+
+
 @ingest_app.command("unmatched-teams")
 def ingest_unmatched_teams(
     seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
@@ -141,7 +164,7 @@ def ingest_unmatched_teams(
             typer.echo(f"season {season}: no teams partition")
             continue
         if "stats_ncaa_team_id" not in teams.columns:
-            typer.echo(f"season {season}: no stats_ncaa_team_id column — run `ingest rosters` first")
+            typer.echo(f"season {season}: no stats_ncaa_team_id column — run `ingest discover-team-ids` first")
             continue
         miss = teams[teams["stats_ncaa_team_id"].isna()]
         typer.echo(f"season {season}: {len(miss)}/{len(teams)} unmatched")
