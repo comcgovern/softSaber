@@ -458,5 +458,68 @@ def stats_pitchers(
     )
 
 
+@stats_app.command("export")
+def stats_export(
+    seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
+    fmt: Annotated[str, typer.Option("--format", help="csv | json | both")] = "json",
+    out: Annotated[str, typer.Option("--out", help="Output directory.")] = "exports",
+    sharded: Annotated[bool, typer.Option(help="JSON: one file per player.")] = False,
+    verbose: bool = False,
+) -> None:
+    """Export rate stats for downstream consumers (website, Firestore, spreadsheets).
+
+    Reads cached rate tables (``batter_rates`` / ``pitcher_rates`` / ``wrc_plus``)
+    plus the rosters table, joins on (season, team, player) to attach
+    ``ncaa_player_id`` where available, and writes:
+
+    * ``<out>/batters.csv``, ``pitchers.csv``, ``wrc.csv`` for CSV.
+    * ``<out>/players.json`` (or sharded ``<out>/players/<id>.json``)
+      for JSON — one Firestore-shaped document per player with identity
+      at the top and per-season stats nested under ``seasons.<year>``.
+
+    Run after ``stats batters``, ``stats pitchers``, and ``stats wrc`` so
+    the rate tables are populated.
+    """
+    _setup_logging(verbose)
+    from pathlib import Path
+
+    from . import storage
+    from .export import build_player_documents, write_csv, write_json
+
+    key = _partition_key(seasons)
+    parts = [str(s) for s in seasons]
+    batters = storage.read_table("batter_rates", partitions=[key])
+    pitchers = storage.read_table("pitcher_rates", partitions=[key])
+    wrc = storage.read_table("wrc_plus", partitions=[key])
+    rosters = storage.read_table("rosters", partitions=parts)
+
+    if batters.empty and pitchers.empty and wrc.empty:
+        raise SystemExit(
+            "no rate tables found for these seasons — run `stats batters`, "
+            "`stats pitchers`, `stats wrc` first"
+        )
+
+    out_dir = Path(out)
+    fmt = fmt.lower()
+    if fmt not in {"csv", "json", "both"}:
+        raise typer.BadParameter("--format must be csv, json, or both")
+
+    if fmt in {"csv", "both"}:
+        csv_paths = write_csv(out_dir, batters, pitchers, wrc if not wrc.empty else None)
+        for name, path in csv_paths.items():
+            typer.echo(f"csv {name}: {path}")
+
+    if fmt in {"json", "both"}:
+        docs = build_player_documents(
+            rosters, batters, pitchers, wrc if not wrc.empty else None,
+        )
+        result = write_json(out_dir, docs, sharded=sharded)
+        with_id = sum(1 for d in docs if not d.get("id_synthesized"))
+        typer.echo(
+            f"json: {result.get('players') or result.get('players_dir')} "
+            f"({result['count']} players, {with_id} with ncaa_player_id)"
+        )
+
+
 if __name__ == "__main__":
     app()
