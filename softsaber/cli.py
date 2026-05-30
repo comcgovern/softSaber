@@ -465,24 +465,68 @@ def stats_unresolved_batters(
     verbose: bool = False,
 ) -> None:
     """List the most-frequent PBP batter strings that ``resolve_batter_names``
-    couldn't match against a roster row.  Use this to discover the name
-    formats nameutil needs to learn before re-running the rate stats.
+    couldn't match against a roster row.  For each token, also reports the
+    team's roster / game_players size and how many of those rows share the
+    trailing surname — which separates a missing-roster bug (team has 0 rows)
+    from a genuine ambiguity (team has 2+ same-surname rows).
     """
     _setup_logging(verbose)
-    pa, _, _ = _build_pa(seasons)
+    from . import storage
+    from .parse.nameutil import _normalize
+
+    pa, _, game_players = _build_pa(seasons)
     if "batter_resolved" not in pa.columns:
         raise SystemExit("PA table has no batter_resolved flag — rerun stats wrc / batters")
     unresolved = pa[~pa["batter_resolved"].fillna(False)]
     total = len(pa)
     n_unres = len(unresolved)
     typer.echo(f"{n_unres}/{total} unresolved ({100*n_unres/total:.1f}%)")
-    by_token = (
-        unresolved.groupby(["batter", "batting_team"])
+
+    rosters = storage.read_table("rosters", partitions=[str(s) for s in seasons])
+
+    # Pre-index rosters and game_players by team_id with a normalized surname
+    # column so we can probe (#roster rows, #surname matches) per (token, team).
+    def _index_by_team(df: pd.DataFrame) -> dict[str, pd.Series]:
+        if df.empty or "team_id" not in df.columns or "last_name" not in df.columns:
+            return {}
+        ln = df["last_name"].fillna("").map(_normalize)
+        out: dict[str, pd.Series] = {}
+        for tid, idx in df.groupby(df["team_id"].astype(str)).groups.items():
+            out[str(tid)] = ln.loc[idx]
+        return out
+
+    roster_ln = _index_by_team(rosters)
+    gp_ln = _index_by_team(game_players)
+
+    has_tid = "batting_team_id" in unresolved.columns
+    grouped = (
+        unresolved.assign(
+            batting_team_id=unresolved["batting_team_id"].astype(str)
+            if has_tid else ""
+        )
+        .groupby(["batter", "batting_team", "batting_team_id"])
         .size().reset_index(name="n")
         .sort_values("n", ascending=False)
         .head(top)
     )
-    typer.echo(by_token.to_string(index=False))
+
+    rows = []
+    for r in grouped.itertuples(index=False):
+        tail = r.batter.split(",")[0].split()[-1] if r.batter else ""
+        surname = _normalize(tail)
+        ros = roster_ln.get(str(r.batting_team_id), pd.Series(dtype=str))
+        gp = gp_ln.get(str(r.batting_team_id), pd.Series(dtype=str))
+        rows.append({
+            "n": r.n,
+            "batter": r.batter,
+            "team": r.batting_team,
+            "ros_n": len(ros),
+            "ros_hits": int((ros == surname).sum()) if len(ros) else 0,
+            "gp_n": len(gp),
+            "gp_hits": int((gp == surname).sum()) if len(gp) else 0,
+        })
+    diag = pd.DataFrame(rows)
+    typer.echo(diag.to_string(index=False))
 
 
 @stats_app.command("export")
