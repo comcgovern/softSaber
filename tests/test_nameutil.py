@@ -114,6 +114,51 @@ def test_match_player_initial_leading_all_caps() -> None:
     assert hit["player_name"] == "Tabby Thomas"
 
 
+def test_match_player_two_letter_initials() -> None:
+    """Run-together initials: 'CJ Haney', 'AG Batson', 'MJ Nicholson'."""
+    players = _make_players(("CJ", "Haney", True), ("Amy", "Adams", False))
+    hit = match_player("CJ Haney", players)
+    assert hit is not None
+    assert hit["player_name"] == "CJ Haney"
+    # The first token need only share its initial with the roster first name.
+    players2 = _make_players(("Abigail", "Batson", True))
+    hit = match_player("AG Batson", players2)
+    assert hit is not None
+    assert hit["player_name"] == "Abigail Batson"
+
+
+def test_match_player_apostrophe_first_name() -> None:
+    players = _make_players(("Z'Natria", "Evans", True), ("Bob", "Smith", False))
+    hit = match_player("Z'Natria Evans", players)
+    assert hit is not None
+    assert hit["player_name"] == "Z'Natria Evans"
+
+
+def test_match_player_truncated_surname() -> None:
+    """Fixed-width feeds truncate the surname; match by prefix + first name."""
+    players = _make_players(("Lydia", "VanderWoude", True), ("Amy", "Adams", False))
+    hit = match_player("Lydia Vander", players)
+    assert hit is not None
+    assert hit["player_name"] == "Lydia VanderWoude"
+    # Single-token truncated surname resolves when unique.
+    players2 = _make_players(("Jane", "Brockenbrough", True), ("Amy", "Adams", False))
+    hit = match_player("Brockenbroug", players2)
+    assert hit is not None
+    assert hit["player_name"] == "Jane Brockenbrough"
+
+
+def test_match_player_surname_only_when_unique() -> None:
+    players = _make_players(("Kim", "Jackson", True), ("Amy", "Adams", False))
+    hit = match_player("Jackson", players)
+    assert hit is not None
+    assert hit["player_name"] == "Kim Jackson"
+
+
+def test_match_player_ambiguous_surname_only_returns_none() -> None:
+    players = _make_players(("Ana", "Flores", True), ("Ivy", "Flores", False))
+    assert match_player("Flores", players) is None
+
+
 def test_match_player_empty_df() -> None:
     assert match_player("KNIGHT, S", pd.DataFrame()) is None
 
