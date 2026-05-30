@@ -162,6 +162,9 @@ def ingest_season_rosters(
                 continue
             df["team_name"] = row.team_name
             df["stats_ncaa_team_id"] = tid
+            # softball_id is the henrygd teamId — same key used as
+            # batting_team_id in the PA table and team_id in game_players.
+            df["team_id"] = str(getattr(row, "softball_id", "") or "")
             if has_seo:
                 df["team_seoname"] = getattr(row, "team_seoname", "")
             df["season"] = year
