@@ -638,18 +638,9 @@ def stats_unresolved_batters(
     if not summary:
         return
 
-    # Bucket EVERY unresolved batter (not just the top-N) by failure cause.
-    # Aggregate per (batter, batting_team_id) so we count each distinct
-    # token once per team, then weight by occurrence count.
-    all_tokens = (
-        unresolved.assign(
-            batting_team_id=unresolved["batting_team_id"].astype(str)
-            if has_tid else ""
-        )
-        .groupby(["batter", "batting_team_id"])
-        .size().reset_index(name="n")
-    )
-
+    # Bucket EVERY unresolved PA row (not just the top-N tokens) by failure
+    # cause.  We iterate the unresolved frame directly — earlier attempts via
+    # groupby silently dropped rows with NaN keys, undercounting by ~99%.
     buckets = {
         "no batting_team_id (Shape-A PBP)": 0,
         "non-D1 team (no roster)": 0,
@@ -657,33 +648,41 @@ def stats_unresolved_batters(
         "matcher bug — 1 surname match (should resolve)": 0,
         "genuine ambiguity — 2+ surname matches (floor)": 0,
         "no roster AND no game_players surname match": 0,
+        "missing batter token": 0,
     }
-    for r in all_tokens.itertuples(index=False):
-        n = int(r.n)
-        tid = str(r.batting_team_id)
-        if not tid:
-            buckets["no batting_team_id (Shape-A PBP)"] += n
+    seen = 0
+    for r in unresolved.itertuples(index=False):
+        seen += 1
+        batter = getattr(r, "batter", None)
+        if not isinstance(batter, str) or not batter:
+            buckets["missing batter token"] += 1
+            continue
+        tid_val = getattr(r, "batting_team_id", "") if has_tid else ""
+        tid = str(tid_val) if tid_val is not None else ""
+        if not tid or tid == "nan":
+            buckets["no batting_team_id (Shape-A PBP)"] += 1
             continue
         seo = team_seo_by_id.get(tid, tid)
         ros = roster_ln.get(seo, pd.Series(dtype=str))
         gp = gp_ln.get(tid, pd.Series(dtype=str))
-        tail = r.batter.split(",")[0].split()[-1] if r.batter else ""
-        surname = _normalize(tail)
+        tail = batter.split(",")[0].split()
+        surname = _normalize(tail[-1]) if tail else ""
         ros_hits = int((ros == surname).sum()) if len(ros) else 0
         gp_hits = int((gp == surname).sum()) if len(gp) else 0
         if len(ros) == 0:
             if gp_hits == 0:
-                buckets["no roster AND no game_players surname match"] += n
+                buckets["no roster AND no game_players surname match"] += 1
             else:
-                buckets["non-D1 team (no roster)"] += n
+                buckets["non-D1 team (no roster)"] += 1
         elif ros_hits == 0:
-            buckets["roster gap — 0 surname matches (fixable: format)"] += n
+            buckets["roster gap — 0 surname matches (fixable: format)"] += 1
         elif ros_hits == 1:
-            buckets["matcher bug — 1 surname match (should resolve)"] += n
+            buckets["matcher bug — 1 surname match (should resolve)"] += 1
         else:
-            buckets["genuine ambiguity — 2+ surname matches (floor)"] += n
+            buckets["genuine ambiguity — 2+ surname matches (floor)"] += 1
 
-    typer.echo("\n=== unresolved-batter buckets (across ALL %d unresolved) ===" % n_unres)
+    typer.echo("\n=== unresolved-batter buckets (across ALL %d unresolved, %d scanned) ==="
+               % (n_unres, seen))
     width = max(len(k) for k in buckets)
     for k, v in sorted(buckets.items(), key=lambda kv: -kv[1]):
         pct = 100 * v / n_unres if n_unres else 0
