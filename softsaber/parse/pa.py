@@ -106,11 +106,24 @@ def resolve_batter_names(
     # game_id alone as a fallback (Shape-A PBP has no batting_team_id).
     gp_by_game_team: dict[tuple[str, str], pd.DataFrame] = {}
     gp_by_game: dict[str, pd.DataFrame] = {}
+    # Bridge: PA's batting_team_id is the numeric henrygd teamId, but
+    # rosters.team_id stores the seoname slug ("elon", "valparaiso") it
+    # inherited from the casablanca scoreboard.  game_players carries both
+    # columns, so use it to translate numeric → seoname when looking up
+    # rosters by team.
+    team_seo_by_id: dict[str, str] = {}
     if not game_players.empty:
         for gid, grp in game_players.groupby("game_id"):
             gp_by_game[str(gid)] = grp.reset_index(drop=True)
             for tid, tgrp in grp.groupby("team_id"):
                 gp_by_game_team[(str(gid), str(tid))] = tgrp.reset_index(drop=True)
+        if "team_seoname" in game_players.columns:
+            for tid, seo in zip(
+                game_players["team_id"].astype(str),
+                game_players["team_seoname"].astype(str),
+            ):
+                if tid and seo and tid not in team_seo_by_id:
+                    team_seo_by_id[tid] = seo
 
     out = pa.copy()
     names: list[str | None] = []
@@ -128,9 +141,11 @@ def resolve_batter_names(
         tid = str(getattr(r, "batting_team_id", "") or "") if has_tid else ""
 
         # Try the richer season-roster table first when available.
+        # Rosters are keyed by seoname; translate from numeric tid.
         hit = None
-        if tid and tid in roster_by_team:
-            hit = match_player(raw, roster_by_team[tid])
+        roster_key = team_seo_by_id.get(tid, tid) if tid else ""
+        if roster_key and roster_key in roster_by_team:
+            hit = match_player(raw, roster_by_team[roster_key])
 
         if hit is None:
             team_players = gp_by_game_team.get((gid, tid)) if tid else None

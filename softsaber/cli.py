@@ -573,6 +573,17 @@ def stats_unresolved_batters(
     roster_ln = _index_by_team(rosters)
     gp_ln = _index_by_team(game_players)
 
+    # rosters.team_id is the seoname slug; pa.batting_team_id is numeric.
+    # Build the numeric→seoname bridge from game_players (which has both).
+    team_seo_by_id: dict[str, str] = {}
+    if not game_players.empty and "team_seoname" in game_players.columns:
+        for tid, seo in zip(
+            game_players["team_id"].astype(str),
+            game_players["team_seoname"].astype(str),
+        ):
+            if tid and seo and tid not in team_seo_by_id:
+                team_seo_by_id[tid] = seo
+
     has_tid = "batting_team_id" in unresolved.columns
     grouped = (
         unresolved.assign(
@@ -589,8 +600,10 @@ def stats_unresolved_batters(
     for r in grouped.itertuples(index=False):
         tail = r.batter.split(",")[0].split()[-1] if r.batter else ""
         surname = _normalize(tail)
-        ros = roster_ln.get(str(r.batting_team_id), pd.Series(dtype=str))
-        gp = gp_ln.get(str(r.batting_team_id), pd.Series(dtype=str))
+        tid = str(r.batting_team_id)
+        seo = team_seo_by_id.get(tid, tid)
+        ros = roster_ln.get(seo, pd.Series(dtype=str))
+        gp = gp_ln.get(tid, pd.Series(dtype=str))
         rows.append({
             "n": r.n,
             "batter": r.batter,
