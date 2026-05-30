@@ -130,16 +130,21 @@ def match_player(
     if m:
         last_norm = _normalize(m.group(1))
         first_norm = _normalize(m.group(2))
-        hit = (
-            _resolve(players, ln, fn, eq(last_norm), eq(first_norm))
-            or _resolve(players, ln, fn, eq(last_norm), starts(first_norm[:1]))
-        )
+        hit = _resolve(players, ln, fn, eq(last_norm), eq(first_norm))
+        if hit is None:
+            hit = _resolve(players, ln, fn, eq(last_norm), starts(first_norm[:1]))
         if hit is not None:
             return hit
 
     # --- No-comma shapes: tokenize ---------------------------------------
-    if "," not in raw:
-        toks = raw.split()
+    # Normalize the no-space initial-leads form ("T.THOMAS" → "T. THOMAS")
+    # so the tokenizer below sees two tokens.  Require the dot so a bare
+    # ALL-CAPS surname like "THOMAS" doesn't get split into "THO MAS".
+    raw_tokenized = re.sub(
+        r"^([A-Z]{1,3}\.)(?=[A-Z])", r"\1 ", raw
+    )
+    if "," not in raw_tokenized:
+        toks = raw_tokenized.split()
         if len(toks) >= 2:
             first_tok, *rest = toks
             last_norm = _normalize(" ".join(rest))
