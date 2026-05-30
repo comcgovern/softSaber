@@ -67,6 +67,18 @@ def _normalize_team_name(name: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# Words frequently present on one side of the name pair but not the other
+# (henrygd vs. stats.ncaa.org).  Stripping these as a fallback catches
+# "Lamar University" ↔ "Lamar", "Valparaiso" ↔ "Valparaiso Univ.", etc.
+_STRIPPABLE_SUFFIX_TOKENS = {"university", "college", "u"}
+
+
+def _strip_suffixes(s: str) -> str:
+    """Return ``s`` with trailing/leading institutional tokens removed."""
+    toks = [t for t in s.split() if t not in _STRIPPABLE_SUFFIX_TOKENS]
+    return " ".join(toks)
+
+
 def discover_and_update_teams(
     teams: pd.DataFrame,
     games: pd.DataFrame,
@@ -104,14 +116,31 @@ def discover_and_update_teams(
     normalised_map: dict[str, str] = {
         _normalize_team_name(n): tid for n, tid in id_map.items()
     }
+    # Suffix-stripped fallback: "lamar university" → "lamar" so it matches
+    # NCAA's bare "Lamar" (and vice versa).  Only populated when the stripped
+    # form is unambiguous within the map.
+    stripped_counts: dict[str, int] = {}
+    for k in normalised_map:
+        stripped_counts[_strip_suffixes(k)] = stripped_counts.get(_strip_suffixes(k), 0) + 1
+    stripped_map: dict[str, str] = {
+        _strip_suffixes(k): tid
+        for k, tid in normalised_map.items()
+        if stripped_counts[_strip_suffixes(k)] == 1 and _strip_suffixes(k)
+    }
 
     def _lookup(name: str) -> str | None:
         if name in id_map:
             return id_map[name]
-        return normalised_map.get(_normalize_team_name(name))
+        norm = _normalize_team_name(name)
+        if norm in normalised_map:
+            return normalised_map[norm]
+        return stripped_map.get(_strip_suffixes(norm))
 
     teams["stats_ncaa_team_id"] = teams["team_name"].apply(_lookup)
     matched = teams["stats_ncaa_team_id"].notna().sum()
+    if matched < len(teams):
+        unmatched = sorted(teams.loc[teams["stats_ncaa_team_id"].isna(), "team_name"].dropna().unique().tolist())
+        log.info("year %s: %d unmatched team names: %s", year, len(unmatched), unmatched)
     log.info("year %s: matched stats_ncaa_team_id for %d/%d teams", year, matched, len(teams))
 
     storage.write_partition("teams", str(year), teams)
