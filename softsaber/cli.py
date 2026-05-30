@@ -537,6 +537,7 @@ def stats_pitchers(
 def stats_unresolved_batters(
     seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
     top: Annotated[int, typer.Option(help="How many distinct tokens to show.")] = 40,
+    summary: Annotated[bool, typer.Option(help="Bucket ALL unresolved by cause.")] = False,
     verbose: bool = False,
 ) -> None:
     """List the most-frequent PBP batter strings that ``resolve_batter_names``
@@ -544,6 +545,10 @@ def stats_unresolved_batters(
     team's roster / game_players size and how many of those rows share the
     trailing surname — which separates a missing-roster bug (team has 0 rows)
     from a genuine ambiguity (team has 2+ same-surname rows).
+
+    With ``--summary``, also buckets every unresolved batter (not just the
+    top-N) by cause so we can see whether the residual is mostly structural
+    floor or fixable matcher gaps.
     """
     _setup_logging(verbose)
     from . import storage
@@ -629,6 +634,60 @@ def stats_unresolved_batters(
         })
     diag = pd.DataFrame(rows)
     typer.echo(diag.to_string(index=False))
+
+    if not summary:
+        return
+
+    # Bucket EVERY unresolved batter (not just the top-N) by failure cause.
+    # Aggregate per (batter, batting_team_id) so we count each distinct
+    # token once per team, then weight by occurrence count.
+    all_tokens = (
+        unresolved.assign(
+            batting_team_id=unresolved["batting_team_id"].astype(str)
+            if has_tid else ""
+        )
+        .groupby(["batter", "batting_team_id"])
+        .size().reset_index(name="n")
+    )
+
+    buckets = {
+        "no batting_team_id (Shape-A PBP)": 0,
+        "non-D1 team (no roster)": 0,
+        "roster gap — 0 surname matches (fixable: format)": 0,
+        "matcher bug — 1 surname match (should resolve)": 0,
+        "genuine ambiguity — 2+ surname matches (floor)": 0,
+        "no roster AND no game_players surname match": 0,
+    }
+    for r in all_tokens.itertuples(index=False):
+        n = int(r.n)
+        tid = str(r.batting_team_id)
+        if not tid:
+            buckets["no batting_team_id (Shape-A PBP)"] += n
+            continue
+        seo = team_seo_by_id.get(tid, tid)
+        ros = roster_ln.get(seo, pd.Series(dtype=str))
+        gp = gp_ln.get(tid, pd.Series(dtype=str))
+        tail = r.batter.split(",")[0].split()[-1] if r.batter else ""
+        surname = _normalize(tail)
+        ros_hits = int((ros == surname).sum()) if len(ros) else 0
+        gp_hits = int((gp == surname).sum()) if len(gp) else 0
+        if len(ros) == 0:
+            if gp_hits == 0:
+                buckets["no roster AND no game_players surname match"] += n
+            else:
+                buckets["non-D1 team (no roster)"] += n
+        elif ros_hits == 0:
+            buckets["roster gap — 0 surname matches (fixable: format)"] += n
+        elif ros_hits == 1:
+            buckets["matcher bug — 1 surname match (should resolve)"] += n
+        else:
+            buckets["genuine ambiguity — 2+ surname matches (floor)"] += n
+
+    typer.echo("\n=== unresolved-batter buckets (across ALL %d unresolved) ===" % n_unres)
+    width = max(len(k) for k in buckets)
+    for k, v in sorted(buckets.items(), key=lambda kv: -kv[1]):
+        pct = 100 * v / n_unres if n_unres else 0
+        typer.echo(f"  {k.ljust(width)}  {v:>7d}  ({pct:5.1f}%)")
 
 
 @stats_app.command("export")
