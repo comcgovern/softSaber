@@ -37,19 +37,19 @@ _PITCHER_CHANGE_PATTERNS: list[re.Pattern[str]] = [
     # The team code is 2-5 uppercase letters (ND, GCU, FURM, DUKE, ARIZ, ...).
     re.compile(
         r"^\s*[A-Z]{2,5}\s+pitching\s+change\s*:\s*"
-        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?(?:\s+[\w'\-]+\.?)?)?)\b",
+        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?)?)",
         re.I,
     ),
     # "Pitching: SMITH, J. for JONES, B." or "Pitching change: SMITH, J."
     re.compile(
         r"^\s*Pitching(?:\s+change)?\s*:\s*"
-        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?(?:\s+[\w'\-]+\.?)?)?)",
+        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?)?)",
         re.I,
     ),
     # "Now pitching: SMITH, J."
     re.compile(
         r"^\s*Now\s+pitching\s*:\s*"
-        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?(?:\s+[\w'\-]+\.?)?)?)",
+        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?)?)",
         re.I,
     ),
     # "P: SMITH, J."
