@@ -146,6 +146,31 @@ def ingest_discover_team_ids(
         rosters_mod.discover_and_update_teams(teams, games, year)
 
 
+@ingest_app.command("inspect-rosters")
+def ingest_inspect_rosters(
+    seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
+) -> None:
+    """Print rosters parquet shape, columns, and a sample to debug join keys."""
+    from . import storage
+
+    for season in seasons:
+        df = storage.read_table("rosters", partitions=[str(season)])
+        typer.echo(f"\n=== season {season} ===")
+        typer.echo(f"rows={len(df)}, columns={list(df.columns)}")
+        if df.empty:
+            continue
+        if "team_id" in df.columns:
+            tid = df["team_id"].astype(str)
+            typer.echo(f"team_id unique values: {tid.nunique()} "
+                       f"(empty/nan: {(tid.isin(['', 'nan', 'None'])).sum()})")
+            typer.echo(f"team_id sample: {tid.head(5).tolist()}")
+        else:
+            typer.echo("MISSING team_id column — re-run `ingest rosters --season N`")
+        cols = [c for c in ["team_id", "team_name", "stats_ncaa_team_id",
+                             "first_name", "last_name", "jersey"] if c in df.columns]
+        typer.echo(df[cols].head(5).to_string(index=False))
+
+
 @ingest_app.command("unmatched-teams")
 def ingest_unmatched_teams(
     seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
