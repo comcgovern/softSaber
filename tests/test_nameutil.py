@@ -170,9 +170,11 @@ def test_match_player_concatenated_surname_initial() -> None:
     hit2 = match_player("FloresA", players2)
     assert hit2 is not None
     assert hit2["player_name"] == "Ana Flores"
-    # Truly ambiguous: two players with same surname AND same initial.
-    players3 = _make_players(("Ana", "Flores", True), ("Abby", "Flores", False))
-    assert match_player("FloresA", players3) is None
+    # Two players share surname and initial — prefers the starter.
+    players3 = _make_players(("Abby", "Flores", False), ("Ana", "Flores", True))
+    hit3 = match_player("FloresA", players3)
+    assert hit3 is not None
+    assert hit3["player_name"] == "Ana Flores"
 
 
 def test_match_player_empty_df() -> None:
