@@ -28,6 +28,9 @@ _FULL_NAME_RE = re.compile(
 )
 # No-comma shapes ("Firstname Lastname", "F. LASTNAME", "CJ Haney") are
 # handled by tokenizing inside match_player rather than dedicated regexes.
+# Concatenated surname+initial: "FloresA", "SmithJ" — Title-case word ending
+# in a lone uppercase letter (the initial) with no separator.
+_CONCAT_INITIAL_RE = re.compile(r"^([A-Z][a-z][\w'\-]*)([A-Z])$")
 
 
 def _normalize(s: str) -> str:
@@ -133,6 +136,20 @@ def match_player(
         hit = _resolve(players, ln, fn, eq(last_norm), eq(first_norm))
         if hit is None:
             hit = _resolve(players, ln, fn, eq(last_norm), starts(first_norm[:1]))
+        if hit is not None:
+            return hit
+
+    # --- Concatenated surname+initial ("FloresA", "SmithJ") ---------------
+    # Some feeds (e.g. Lamar) append the first initial directly to the surname
+    # with no separator.  Detect Title-case word ending in a lone uppercase
+    # letter and try surname + initial match.
+    m = _CONCAT_INITIAL_RE.match(raw)
+    if m:
+        last_norm = _normalize(m.group(1))
+        initial = m.group(2).lower()
+        hit = _resolve(players, ln, fn, eq(last_norm), starts(initial))
+        if hit is None and len(last_norm) >= 4:
+            hit = _resolve(players, ln, fn, starts(last_norm), starts(initial))
         if hit is not None:
             return hit
 

@@ -159,6 +159,22 @@ def test_match_player_ambiguous_surname_only_returns_none() -> None:
     assert match_player("Flores", players) is None
 
 
+def test_match_player_concatenated_surname_initial() -> None:
+    """Some feeds (e.g. Lamar) concatenate surname+initial: 'FloresA', 'FloresI'."""
+    players = _make_players(("Araceli", "Flores", True), ("Bob", "Smith", False))
+    hit = match_player("FloresA", players)
+    assert hit is not None
+    assert hit["player_name"] == "Araceli Flores"
+    # Two Flores but different initials — still disambiguates.
+    players2 = _make_players(("Ana", "Flores", True), ("Ivy", "Flores", False))
+    hit2 = match_player("FloresA", players2)
+    assert hit2 is not None
+    assert hit2["player_name"] == "Ana Flores"
+    # Truly ambiguous: two players with same surname AND same initial.
+    players3 = _make_players(("Ana", "Flores", True), ("Abby", "Flores", False))
+    assert match_player("FloresA", players3) is None
+
+
 def test_match_player_empty_df() -> None:
     assert match_player("KNIGHT, S", pd.DataFrame()) is None
 
