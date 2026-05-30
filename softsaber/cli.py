@@ -123,6 +123,33 @@ def ingest_teams(
     typer.echo(f"teams written: {len(df)}")
 
 
+@ingest_app.command("unmatched-teams")
+def ingest_unmatched_teams(
+    seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
+) -> None:
+    """List teams missing ``stats_ncaa_team_id`` (no rosters will be scraped).
+
+    These are the henrygd team names that didn't resolve to a stats.ncaa.org
+    team ID during ``ingest rosters`` discovery — usually a name-format
+    mismatch ("Lamar University" vs "Lamar") rather than a defunct school.
+    """
+    from . import storage
+
+    for season in seasons:
+        teams = storage.read_table("teams", partitions=[str(season)])
+        if teams.empty:
+            typer.echo(f"season {season}: no teams partition")
+            continue
+        if "stats_ncaa_team_id" not in teams.columns:
+            typer.echo(f"season {season}: no stats_ncaa_team_id column — run `ingest rosters` first")
+            continue
+        miss = teams[teams["stats_ncaa_team_id"].isna()]
+        typer.echo(f"season {season}: {len(miss)}/{len(teams)} unmatched")
+        if not miss.empty:
+            for n in sorted(miss["team_name"].dropna().unique().tolist()):
+                typer.echo(f"  {n}")
+
+
 @ingest_app.command("pbp")
 def ingest_pbp(
     season: Annotated[int | None, typer.Option(help="Season year. Required unless --date is given.")] = None,
