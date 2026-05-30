@@ -98,6 +98,22 @@ def test_match_player_firstname_lastname_order() -> None:
     assert hit["player_name"] == "Julia Pike"
 
 
+def test_match_player_initial_leading_all_caps() -> None:
+    """Initial-leads form ('T. THOMAS') common in some NCAA softball feeds."""
+    players = _make_players(("Tabby", "Thomas", True), ("Amy", "Adams", False))
+    hit = match_player("T. THOMAS", players)
+    assert hit is not None
+    assert hit["player_name"] == "Tabby Thomas"
+    # No-space variant.
+    hit = match_player("T.THOMAS", players)
+    assert hit is not None
+    assert hit["player_name"] == "Tabby Thomas"
+    # No-dot variant.
+    hit = match_player("T THOMAS", players)
+    assert hit is not None
+    assert hit["player_name"] == "Tabby Thomas"
+
+
 def test_match_player_empty_df() -> None:
     assert match_player("KNIGHT, S", pd.DataFrame()) is None
 

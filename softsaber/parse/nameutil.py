@@ -26,6 +26,12 @@ _NAME_RE = re.compile(r"^([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+)*),\s*([A-Z]\.?)\s*$"
 _FULL_NAME_RE = re.compile(
     r"^([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+)*),\s*([A-Z][a-z][\w'\-]*)\s*$"
 )
+# Matches "F. LASTNAME" / "F.LASTNAME" / "F LASTNAME" — first initial leads.
+# Distinct from the title-case _FIRST_LAST_RE because here the surname
+# is often ALL CAPS in PBP.
+_INITIAL_LAST_RE = re.compile(
+    r"^([A-Z])\.?\s*([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+)*)\s*$"
+)
 # Matches "Firstname Lastname" (no comma): two title-case tokens.
 _FIRST_LAST_RE = re.compile(
     r"^([A-Z][a-z][\w'\-]*)\s+([A-Z][\w'\-]+(?:\s+[A-Z][\w'\-]+)*)\s*$"
@@ -132,7 +138,16 @@ def match_player(
         if hit is not None:
             return hit
 
-    # 4. Last-name only fallback.
+    # 4. "F. LASTNAME" — initial leads, surname trails (often ALL CAPS).
+    m = _INITIAL_LAST_RE.match(raw)
+    if m:
+        initial = m.group(1).lower()
+        last_norm = _normalize(m.group(2))
+        hit = _resolve(players, last_norm, lambda f: f.startswith(initial))
+        if hit is not None:
+            return hit
+
+    # 5. Last-name only fallback.
     last_only = _normalize(raw.split(",")[0].strip())
     mask_last = players["last_name"].fillna("").str.lower().apply(_normalize) == last_only
     hits_last = players[mask_last]

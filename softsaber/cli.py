@@ -458,6 +458,33 @@ def stats_pitchers(
     )
 
 
+@stats_app.command("unresolved-batters")
+def stats_unresolved_batters(
+    seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),
+    top: Annotated[int, typer.Option(help="How many distinct tokens to show.")] = 40,
+    verbose: bool = False,
+) -> None:
+    """List the most-frequent PBP batter strings that ``resolve_batter_names``
+    couldn't match against a roster row.  Use this to discover the name
+    formats nameutil needs to learn before re-running the rate stats.
+    """
+    _setup_logging(verbose)
+    pa, _, _ = _build_pa(seasons)
+    if "batter_resolved" not in pa.columns:
+        raise SystemExit("PA table has no batter_resolved flag — rerun stats wrc / batters")
+    unresolved = pa[~pa["batter_resolved"].fillna(False)]
+    total = len(pa)
+    n_unres = len(unresolved)
+    typer.echo(f"{n_unres}/{total} unresolved ({100*n_unres/total:.1f}%)")
+    by_token = (
+        unresolved.groupby(["batter", "batting_team"])
+        .size().reset_index(name="n")
+        .sort_values("n", ascending=False)
+        .head(top)
+    )
+    typer.echo(by_token.to_string(index=False))
+
+
 @stats_app.command("export")
 def stats_export(
     seasons: Annotated[list[int], typer.Option("--seasons", "-s")] = list(TARGET_SEASONS),

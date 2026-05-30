@@ -64,10 +64,19 @@ OUTCOME_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bgrounded out\b", re.I), "GO"),
 ]
 
-# Heuristic batter-name extractor. NCAA PBP usually starts each PA with the
-# batter's "Last, F." or "Last F." followed by a verb fragment.
+# Heuristic batter-name extractor.  Three PBP shapes observed in NCAA softball:
+#   * "LASTNAME, F. singled..." — standard last-comma-initial
+#   * "Firstname Lastname singled..." — free-text feed
+#   * "F. LASTNAME singled..." — initial-leads form (e.g. "T. THOMAS")
+# Optional "F. " prefix at the start covers the third case; the rest is the
+# original lastname-or-titlecase capture.
 _BATTER_RE = re.compile(
-    r"^\s*(?P<name>[A-Z][\w'\-]+(?:,\s*[A-Z]\.?)?(?:\s+[A-Z][\w'\-]+)?)\s+"
+    r"^\s*(?P<name>"
+    r"(?:[A-Z]\.?\s+)?"               # optional "F. " or "F " prefix
+    r"[A-Z][\w'\-]+"                  # surname or first title-case token
+    r"(?:,\s*[A-Z]\.?)?"              # optional ", F."
+    r"(?:\s+[A-Z][\w'\-]+)?"          # optional " Lastname"
+    r")\s+"
     r"(?:singled|doubled|tripled|homered|walked|"
     r"intentionally walked|grounded|flied|lined|popped|fouled|"
     r"struck out|hit (?:by pitch|into double play)|reached)"
