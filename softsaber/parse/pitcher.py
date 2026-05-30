@@ -37,19 +37,19 @@ _PITCHER_CHANGE_PATTERNS: list[re.Pattern[str]] = [
     # The team code is 2-5 uppercase letters (ND, GCU, FURM, DUKE, ARIZ, ...).
     re.compile(
         r"^\s*[A-Z]{2,5}\s+pitching\s+change\s*:\s*"
-        r"(?P<name>[A-Z][\w'\-]+(?:,\s*[\w'\-]+(?:\s+[\w'\-]+)?)?)\b",
+        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?(?:\s+[\w'\-]+\.?)?)?)\b",
         re.I,
     ),
     # "Pitching: SMITH, J. for JONES, B." or "Pitching change: SMITH, J."
     re.compile(
         r"^\s*Pitching(?:\s+change)?\s*:\s*"
-        r"(?P<name>[A-Z][\w'\-]+(?:,\s*[\w'\-]+(?:\s+[\w'\-]+)?)?)",
+        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?(?:\s+[\w'\-]+\.?)?)?)",
         re.I,
     ),
     # "Now pitching: SMITH, J."
     re.compile(
         r"^\s*Now\s+pitching\s*:\s*"
-        r"(?P<name>[A-Z][\w'\-]+(?:,\s*[\w'\-]+(?:\s+[\w'\-]+)?)?)",
+        r"(?P<name>[A-Z][\w'\-]+\.?(?:,\s*[\w'\-]+\.?(?:\s+[\w'\-]+\.?)?)?)",
         re.I,
     ),
     # "P: SMITH, J."
@@ -62,12 +62,12 @@ _PITCHER_CHANGE_PATTERNS: list[re.Pattern[str]] = [
         re.I,
     ),
     # "Firstname Lastname to p[itcher] for X" / "Firstname Lastname to p."
-    # Title-case first + last, then " to p" — same start-anchor protects
-    # us from picking up "Player Name grounded out to p" because
-    # "grounded" isn't part of the name capture.
+    # NOTE: no re.I — case-insensitive matching would let lowercase words
+    # like "grounded out" satisfy [A-Z][a-z]+, causing false matches on
+    # at-bat lines ending in "to p".  Case-sensitive ensures only proper
+    # Title-Case tokens count as a player name.
     re.compile(
         r"^\s*(?P<name>[A-Z][a-z]+(?:[\s'\-][A-Z][a-z]+)+)\s+to\s+p(?:itcher)?\b",
-        re.I,
     ),
     # "SMITH, J. relieved JONES, B."
     re.compile(
@@ -261,20 +261,12 @@ def attribute_pitchers(
         events = str(getattr(r, "events", "") or "") if has_ev else ""
 
         # Pitching change handling — must run before stamping so the new
-        # pitcher takes effect from this row forward.  ~99% of rows are
-        # at-bat events that don't match the pitching-change hint regex;
-        # only call the more expensive classify() to confirm an at-bat
-        # when we need to distinguish "real PA" from "unmatched sub".
-        incoming: str | None = None
-        is_at_bat = False
-        looks_pitching = bool(events) and bool(_PITCHER_SUB_HINT_RE.search(events))
-        if looks_pitching:
-            incoming = parse_pitcher_change(events)
-            if incoming is None:
-                # Only at this point is classify() worth running — we need
-                # to know whether the unmatched line is at-bat narration
-                # ("X singled to pitcher") or a sub we should log.
-                is_at_bat = classify(events).outcome is not None
+        # pitcher takes effect from this row forward.  parse_pitcher_change
+        # is cheap (8 anchored regexes, won't match at-bat narration), so
+        # we always try it.  classify() is only invoked for diagnostic
+        # logging on lines the hint regex flags as pitching-shaped but
+        # parse_pitcher_change didn't match.
+        incoming = parse_pitcher_change(events) if events else None
 
         if incoming and f_tid:
             players = gp_by_game_team.get((gid, f_tid))
@@ -293,14 +285,14 @@ def attribute_pitchers(
                     state[f_tid] = {"name": incoming, "player_id": None}
             else:
                 state[f_tid] = {"name": incoming, "player_id": None}
-        elif (
-            events and not is_at_bat and _PITCHER_SUB_HINT_RE.search(events)
-        ):
-            # Looks pitching-specific but didn't match any pattern — log
-            # so we can iterate on patterns later.
-            unmatched_subs += 1
-            if log.isEnabledFor(logging.DEBUG):
-                log.debug("unmatched pitching-change line: %s", events[:120])
+        elif events and _PITCHER_SUB_HINT_RE.search(events):
+            # Looks pitching-specific but didn't match any pattern.  Use
+            # classify() to filter out at-bat narration ("X singled to
+            # pitcher", "X grounded out to p") before logging.
+            if classify(events).outcome is None:
+                unmatched_subs += 1
+                if log.isEnabledFor(logging.DEBUG):
+                    log.debug("unmatched pitching-change line: %s", events[:120])
 
         active = state.get(f_tid, {}) if f_tid else {}
         pitchers.append(active.get("name") or None)

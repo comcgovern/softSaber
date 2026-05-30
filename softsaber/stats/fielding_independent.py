@@ -106,7 +106,7 @@ def add_xfip(
     else:
         constant = 0.0
 
-    df["xFIP"] = np.where(qualified, (per_game + constant).round(3), np.nan)
+    df["xFIP"] = np.where(qualified, per_game + constant, np.nan)
     log.info("add_xfip: lg HR/FBO=%.3f, constant=%.3f", lg_rate, constant)
     return df
 
