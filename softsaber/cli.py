@@ -561,16 +561,30 @@ def stats_unresolved_batters(
 
     # Pre-index rosters and game_players by team_id with a normalized surname
     # column so we can probe (#roster rows, #surname matches) per (token, team).
-    def _index_by_team(df: pd.DataFrame) -> dict[str, pd.Series]:
-        if df.empty or "team_id" not in df.columns or "last_name" not in df.columns:
+    # rosters carries only player_name (NCAA "Last, First"); derive last_name
+    # the same way resolve_batter_names does so the diagnostic mirrors it.
+    def _index_by_team(df: pd.DataFrame, derive_last: bool = False) -> dict[str, pd.Series]:
+        if df.empty or "team_id" not in df.columns:
             return {}
-        ln = df["last_name"].fillna("").map(_normalize)
+        if "last_name" in df.columns:
+            ln_raw = df["last_name"].fillna("")
+        elif derive_last and "player_name" in df.columns:
+            split = df["player_name"].fillna("").str.split(",", n=1, expand=True)
+            ln_raw = split[0].fillna("")
+            no_comma = ln_raw.str.strip() == df["player_name"].fillna("").str.strip()
+            if no_comma.any():
+                alt = df.loc[no_comma, "player_name"].fillna("").str.rsplit(" ", n=1, expand=True)
+                if alt.shape[1] == 2:
+                    ln_raw.loc[no_comma] = alt[1].fillna("")
+        else:
+            return {}
+        ln = ln_raw.map(_normalize)
         out: dict[str, pd.Series] = {}
         for tid, idx in df.groupby(df["team_id"].astype(str)).groups.items():
             out[str(tid)] = ln.loc[idx]
         return out
 
-    roster_ln = _index_by_team(rosters)
+    roster_ln = _index_by_team(rosters, derive_last=True)
     gp_ln = _index_by_team(game_players)
 
     # rosters.team_id is the seoname slug; pa.batting_team_id is numeric.
