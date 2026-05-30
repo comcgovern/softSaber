@@ -96,15 +96,22 @@ def resolve_batter_names(
         if "starter" not in prepped.columns:
             prepped["starter"] = False
         # NCAA roster pages render names as "Last, First"; split into the
-        # first_name/last_name columns match_player expects.
+        # first_name/last_name columns match_player expects.  Fall back to
+        # "First Last" via rsplit when no comma is present.
         if "last_name" not in prepped.columns or "first_name" not in prepped.columns:
             split = prepped["player_name"].fillna("").str.split(",", n=1, expand=True)
             last = split[0].fillna("").str.strip()
-            first = split[1].fillna("").str.strip() if split.shape[1] > 1 else ""
-            # Fall back to "First Last" form when no comma is present.
+            if split.shape[1] > 1:
+                first = split[1].fillna("").str.strip()
+            else:
+                first = pd.Series("", index=prepped.index, dtype=str)
             no_comma = first == ""
             if no_comma.any():
-                alt = prepped.loc[no_comma, "player_name"].fillna("").str.rsplit(" ", n=1, expand=True)
+                alt = (
+                    prepped.loc[no_comma, "player_name"]
+                    .fillna("")
+                    .str.rsplit(" ", n=1, expand=True)
+                )
                 if alt.shape[1] == 2:
                     first.loc[no_comma] = alt[0].fillna("").str.strip()
                     last.loc[no_comma] = alt[1].fillna("").str.strip()
